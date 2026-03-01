@@ -27,7 +27,7 @@ public sealed class FileWatcherService : IDisposable
         };
 
         _watcher.Created += OnCreated;
-        // 后续扩展：Changed, Deleted, Renamed
+        _watcher.Renamed += OnRenamed;
     }
 
     public void Start()
@@ -43,6 +43,10 @@ public sealed class FileWatcherService : IDisposable
     private void OnCreated(object sender, FileSystemEventArgs e)
     {
         FileLogger.Log($"FileWatcher.Created: {e.FullPath}");
+
+        // 过滤 CfConvertToPlaceholder 触发的反馈事件
+        if (_engine.IsRecentlySynced(e.FullPath)) return;
+
         // 只处理文件夹（当前阶段）
         if (Directory.Exists(e.FullPath))
         {
@@ -59,6 +63,27 @@ public sealed class FileWatcherService : IDisposable
         {
             FileLogger.Log($"  → 不是目录，跳过");
         }
+    }
+
+    private void OnRenamed(object sender, RenamedEventArgs e)
+    {
+        FileLogger.Log($"FileWatcher.Renamed: {e.OldFullPath} → {e.FullPath}");
+
+        // 过滤 CfConvertToPlaceholder 触发的反馈事件
+        if (_engine.IsRecentlySynced(e.FullPath)) return;
+
+        var relativePath = Path.GetRelativePath(_syncFolder, e.FullPath)
+                               .Replace('\\', '/');
+        var oldRelativePath = Path.GetRelativePath(_syncFolder, e.OldFullPath)
+                                  .Replace('\\', '/');
+
+        FileLogger.Log($"  → 入队 RenameItem: {oldRelativePath} → {relativePath}");
+        _engine.Enqueue(new SyncEvent(
+            SyncEventType.RenameItem,
+            e.FullPath,
+            relativePath,
+            e.OldFullPath,
+            oldRelativePath));
     }
 
     public void Dispose()

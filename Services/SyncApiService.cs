@@ -126,4 +126,26 @@ public class SyncApiService
             return false;
         }
     }
+
+    /// <summary>
+    /// 重命名服务端文件或目录
+    /// </summary>
+    public async Task<bool> RenameAsync(string oldPath, string newPath)
+    {
+        try
+        {
+            var url = $"{_baseUrl}/rename";
+            var payload = JsonSerializer.Serialize(new { old_path = oldPath, new_path = newPath });
+            FileLogger.Log($"RenameAsync: POST {url} ({oldPath} → {newPath})");
+            var content = new StringContent(payload, Encoding.UTF8, "application/json");
+            var response = await _http.PostAsync(url, content);
+            FileLogger.Log($"  HTTP {(int)response.StatusCode}");
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"  RenameAsync 异常: {ex.Message}");
+            return false;
+        }
+    }
 }
