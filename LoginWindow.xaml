@@ -1,0 +1,67 @@
+<Window x:Class="EhangNAS_Sync.LoginWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="亿航Drive - 登录"
+        Width="420" Height="480"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize"
+        Background="#EEF2F7">
+    <Grid>
+        <Border Background="White" CornerRadius="6" Padding="32,28"
+                Margin="24" VerticalAlignment="Center">
+            <Border.Effect>
+                <DropShadowEffect BlurRadius="20" ShadowDepth="2" Opacity="0.15" Color="#000"/>
+            </Border.Effect>
+            <StackPanel>
+                <!-- 标题 -->
+                <TextBlock Text="亿航Drive" FontSize="22" FontWeight="SemiBold"
+                           Foreground="#1A73E8" HorizontalAlignment="Center" Margin="0,0,0,24"/>
+
+                <!-- 服务器 -->
+                <TextBlock Text="服务器" FontSize="13" Foreground="#333" Margin="0,0,0,4"/>
+                <TextBox x:Name="TxtServer" Height="32" Padding="8,5"
+                         FontSize="13" BorderBrush="#CCC" BorderThickness="1"
+                         Text="192.168.16.15:8000" Margin="0,0,0,12"/>
+
+                <!-- 用户名 -->
+                <TextBlock Text="用户名" FontSize="13" Foreground="#333" Margin="0,0,0,4"/>
+                <TextBox x:Name="TxtUsername" Height="32" Padding="8,5"
+                         FontSize="13" BorderBrush="#CCC" BorderThickness="1"
+                         Margin="0,0,0,12"/>
+
+                <!-- 密码 -->
+                <TextBlock Text="密码" FontSize="13" Foreground="#333" Margin="0,0,0,4"/>
+                <Grid Margin="0,0,0,14">
+                    <PasswordBox x:Name="PwdPassword" Height="32" Padding="8,5,36,5"
+                                 FontSize="13" BorderBrush="#CCC" BorderThickness="1"/>
+                    <TextBox x:Name="TxtPasswordPlain" Height="32" Padding="8,5,36,5"
+                             FontSize="13" BorderBrush="#CCC" BorderThickness="1"
+                             Visibility="Collapsed"/>
+                    <Button x:Name="BtnEye" Content="👁" Width="32" Height="28"
+                            HorizontalAlignment="Right" VerticalAlignment="Center"
+                            Margin="0,0,2,0"
+                            Background="Transparent" BorderThickness="0"
+                            Cursor="Hand" FontSize="14"
+                            Click="BtnEye_Click"/>
+                </Grid>
+
+                <!-- 自动登录 -->
+                <CheckBox x:Name="ChkAutoLogin" Content="下次自动登录"
+                          IsChecked="True"
+                          FontSize="13" Margin="0,0,0,16"/>
+
+                <!-- 错误信息 -->
+                <TextBlock x:Name="TxtError" Foreground="#D32F2F" FontSize="12"
+                           TextWrapping="Wrap" Margin="0,0,0,10"
+                           Visibility="Collapsed"/>
+
+                <!-- 登录按钮 -->
+                <Button x:Name="BtnLogin" Content="登  录" Height="36"
+                        FontSize="14" FontWeight="SemiBold"
+                        Foreground="White" Background="#1A73E8"
+                        BorderThickness="0" Cursor="Hand"
+                        Click="BtnLogin_Click"/>
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>
