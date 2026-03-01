@@ -44,10 +44,10 @@ internal static class CldApi
         IntPtr ConvertUsn,    // LONG*
         IntPtr Overlapped);   // OVERLAPPED*
 
-    [DllImport("cldapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    [DllImport("cldapi.dll", CharSet = CharSet.Unicode)]
     public static extern int CfCreatePlaceholders(
-        [MarshalAs(UnmanagedType.LPWStr)] string BaseDirectoryPath,
-        [In, Out, MarshalAs(UnmanagedType.LPArray)] CF_PLACEHOLDER_CREATE_INFO[] PlaceholderArray,
+        string BaseDirectoryPath,
+        [In, Out] CF_PLACEHOLDER_CREATE_INFO[] PlaceholderArray,
         uint PlaceholderCount,
         CF_CREATE_FLAGS CreateFlags,
         out uint EntriesProcessed);
@@ -136,54 +136,45 @@ internal static class CldApi
 
     // ═══════════════════════════════════════════════════════════════
     //  CF_PLACEHOLDER_CREATE_INFO 及相关结构体
-    //  使用 LayoutKind.Sequential + 嵌套结构体，与 Vanara/tyranid 等
-    //  已验证实现保持一致，由 CLR 自动处理对齐。
+    //  使用 LayoutKind.Sequential 扁平布局，与参考项目保持一致。
+    //  RelativeFileName 用 IntPtr，由调用者手动 Marshal。
     // ═══════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// FILE_BASIC_INFO — 文件基本属性（时间 + Attributes）
-    /// </summary>
-    [StructLayout(LayoutKind.Sequential)]
-    public struct FILE_BASIC_INFO
-    {
-        public long CreationTime;
-        public long LastAccessTime;
-        public long LastWriteTime;
-        public long ChangeTime;
-        public uint FileAttributes;
-    }
-
-    /// <summary>
-    /// CF_FS_METADATA — 文件系统元数据
+    /// CF_FS_METADATA — 文件系统元数据（扁平结构，含显式 padding）
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public struct CF_FS_METADATA
     {
-        public FILE_BASIC_INFO BasicInfo;
+        public long BasicInfo_CreationTime;
+        public long BasicInfo_LastAccessTime;
+        public long BasicInfo_LastWriteTime;
+        public long BasicInfo_ChangeTime;
+        public uint BasicInfo_FileAttributes;
+        public uint _padding;               // 对齐 FileSize 到 8 字节
         public long FileSize;
     }
 
     /// <summary>
-    /// CF_PLACEHOLDER_CREATE_INFO — CfCreatePlaceholders 的占位符描述
-    /// RelativeFileName 使用 string + LPWStr，由 marshaller 自动处理。
+    /// CF_PLACEHOLDER_CREATE_INFO — CfCreatePlaceholders 的占位符描述。
+    /// RelativeFileName 是 IntPtr（LPCWSTR），由调用者用 Marshal.StringToHGlobalUni 分配。
     /// Result / CreateUsn 为输出字段。
     /// </summary>
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    [StructLayout(LayoutKind.Sequential)]
     public struct CF_PLACEHOLDER_CREATE_INFO
     {
-        [MarshalAs(UnmanagedType.LPWStr)]
-        public string RelativeFileName;
-
+        public IntPtr RelativeFileName;                 // LPCWSTR
         public CF_FS_METADATA FsMetadata;
-
-        public IntPtr FileIdentity;
+        public IntPtr FileIdentity;                     // LPCVOID
         public uint FileIdentityLength;
-
         public CF_PLACEHOLDER_CREATE_FLAGS Flags;
-
-        public int Result;       // HRESULT [output]
-        public long CreateUsn;   // USN [output]
+        public int Result;                              // HRESULT [output]
+        public long CreateUsn;                          // USN [output]
     }
+
+    // 文件属性常量
+    public const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
+    public const uint FILE_ATTRIBUTE_NORMAL = 0x80;
 
     // ═══════════════════════════════════════════════════════════════
     //  回调委托 — 使用 IntPtr 避免结构体编组问题
@@ -245,26 +236,28 @@ internal static class CldApi
     }
 
     // ═══════════════════════════════════════════════════════════════
-    //  CF_OPERATION_INFO (x64, 40 bytes)
+    //  CF_OPERATION_INFO (x64, 48 bytes)
     //
     //    Offset  0: StructSize       (ULONG, 4)
     //    Offset  4: Type             (enum, 4)
     //    Offset  8: ConnectionKey    (LARGE_INTEGER, 8)
     //    Offset 16: TransferKey      (LARGE_INTEGER, 8)
     //    Offset 24: CorrelationVector (pointer, 8)
-    //    Offset 32: RequestKey       (LARGE_INTEGER, 8)
-    //    Total: 40 bytes
+    //    Offset 32: SyncStatus       (pointer, 8)   ← 之前遗漏！
+    //    Offset 40: RequestKey       (LARGE_INTEGER, 8)
+    //    Total: 48 bytes
     // ═══════════════════════════════════════════════════════════════
 
-    [StructLayout(LayoutKind.Explicit, Size = 40)]
+    [StructLayout(LayoutKind.Sequential)]
     public struct CF_OPERATION_INFO
     {
-        [FieldOffset(0)]  public uint StructSize;
-        [FieldOffset(4)]  public CF_OPERATION_TYPE Type;
-        [FieldOffset(8)]  public long ConnectionKey;
-        [FieldOffset(16)] public long TransferKey;
-        [FieldOffset(24)] public IntPtr CorrelationVector;
-        [FieldOffset(32)] public long RequestKey;
+        public uint StructSize;
+        public CF_OPERATION_TYPE Type;
+        public long ConnectionKey;
+        public long TransferKey;
+        public IntPtr CorrelationVector;
+        public IntPtr SyncStatus;               // CF_SYNC_STATUS*，可为 IntPtr.Zero
+        public long RequestKey;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -284,19 +277,23 @@ internal static class CldApi
     //    Struct size = 48 (aligned to largest union variant)
     // ═══════════════════════════════════════════════════════════════
 
-    public const uint CF_SIZE_OF_OP_PARAM_TRANSFER_PLACEHOLDERS = 40;
+    // ═══════════════════════════════════════════════════════════════
+    //  CF_OPERATION_PARAMETERS — TransferPlaceholders 变体 (x64)
+    //  使用 Sequential 布局，对齐参考项目。
+    // ═══════════════════════════════════════════════════════════════
 
-    [StructLayout(LayoutKind.Explicit, Size = 48)]
+    [StructLayout(LayoutKind.Sequential)]
     public struct CF_OPERATION_PARAMETERS
     {
-        [FieldOffset(0)]  public uint ParamSize;
-        // Union: TransferPlaceholders variant
-        [FieldOffset(8)]  public uint Flags;
-        [FieldOffset(12)] public int CompletionStatus;     // NTSTATUS (LONG = 4 bytes!)
-        [FieldOffset(16)] public long PlaceholderTotalCount;
-        [FieldOffset(24)] public IntPtr PlaceholderArray;
-        [FieldOffset(32)] public uint PlaceholderCount;
-        [FieldOffset(36)] public uint EntriesProcessed;
+        public uint ParamSize;
+        public uint _padding;               // 对齐 union 到 8 字节
+        // union TransferPlaceholders:
+        public uint Flags;
+        public int CompletionStatus;        // NTSTATUS
+        public long PlaceholderTotalCount;
+        public IntPtr PlaceholderArray;     // CF_PLACEHOLDER_CREATE_INFO*
+        public uint PlaceholderCount;
+        public uint EntriesProcessed;
     }
 
     // ═══════════════════════════════════════════════════════════════

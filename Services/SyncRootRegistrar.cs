@@ -37,12 +37,11 @@ public static class SyncRootRegistrar
             IconResource = @"%SystemRoot%\system32\imageres.dll,-1043",
             Version = "1.0",
             HydrationPolicy = StorageProviderHydrationPolicy.Full,
-            HydrationPolicyModifier = StorageProviderHydrationPolicyModifier.AutoDehydrationAllowed,
-            PopulationPolicy = StorageProviderPopulationPolicy.AlwaysFull,
+            HydrationPolicyModifier = StorageProviderHydrationPolicyModifier.StreamingAllowed
+                                    | StorageProviderHydrationPolicyModifier.AutoDehydrationAllowed,
+            PopulationPolicy = StorageProviderPopulationPolicy.Full,
             InSyncPolicy = StorageProviderInSyncPolicy.FileCreationTime
-                         | StorageProviderInSyncPolicy.FileLastWriteTime
-                         | StorageProviderInSyncPolicy.DirectoryCreationTime
-                         | StorageProviderInSyncPolicy.DirectoryLastWriteTime,
+                         | StorageProviderInSyncPolicy.DirectoryCreationTime,
             HardlinkPolicy = StorageProviderHardlinkPolicy.None,
             Context = CryptographicBuffer.ConvertStringToBinary(
                 syncRootId, BinaryStringEncoding.Utf8),
