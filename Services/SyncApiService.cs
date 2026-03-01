@@ -84,6 +84,31 @@ public class SyncApiService
     }
 
     /// <summary>
+    /// 下载文件指定范围的字节（FETCH_DATA 回调使用）
+    /// </summary>
+    public async Task<byte[]> DownloadFileBytesAsync(string relativePath, long offset, long length)
+    {
+        try
+        {
+            var url = $"{_baseUrl}/download?path={Uri.EscapeDataString(relativePath)}";
+            FileLogger.Log($"DownloadFileBytesAsync: GET {url} (offset={offset}, length={length})");
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            if (length > 0)
+                request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(offset, offset + length - 1);
+            var resp = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            resp.EnsureSuccessStatusCode();
+            var data = await resp.Content.ReadAsByteArrayAsync();
+            FileLogger.Log($"  下载完成: {data.Length} bytes");
+            return data;
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"  DownloadFileBytesAsync 异常: {ex.Message}");
+            throw;
+        }
+    }
+
+    /// <summary>
     /// 在服务端创建目录
     /// </summary>
     public async Task<bool> MkdirAsync(string relativePath)

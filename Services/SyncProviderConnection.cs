@@ -224,11 +224,119 @@ public sealed class SyncProviderConnection : IDisposable
 
     /// <summary>
     /// FETCH_DATA 回调 — Windows 尝试下载文件内容时调用。
-    /// 暂不实现，直接忽略。
+    /// 从服务端下载数据，通过 CfExecute + TRANSFER_DATA 回传给系统。
     /// </summary>
     private static void OnFetchData(IntPtr callbackInfoPtr, IntPtr callbackParamsPtr)
     {
-        FileLogger.Log("FETCH_DATA 回调触发（暂未实现）");
+        FileLogger.Log("FETCH_DATA 回调触发");
+        try
+        {
+            long connectionKey = CallbackInfoReader.GetConnectionKey(callbackInfoPtr);
+            long transferKey = CallbackInfoReader.GetTransferKey(callbackInfoPtr);
+            long requestKey = CallbackInfoReader.GetRequestKey(callbackInfoPtr);
+            long fileSize = CallbackInfoReader.GetFileSize(callbackInfoPtr);
+            string normalizedPath = CallbackInfoReader.GetNormalizedPathString(callbackInfoPtr);
+            FileLogger.Log($"  path={normalizedPath}, fileSize={fileSize}");
+
+            // 解析 FETCH_DATA 参数（请求的文件范围）
+            var fetchParams = Marshal.PtrToStructure<CF_CALLBACK_PARAMETERS_FETCHDATA>(callbackParamsPtr);
+            long requiredOffset = fetchParams.FetchData.RequiredFileOffset;
+            long requiredLength = fetchParams.FetchData.RequiredLength;
+            FileLogger.Log($"  请求范围: offset={requiredOffset}, length={requiredLength}");
+
+            // 从完整路径计算服务端相对路径
+            string relativePath = GetRelativePath(normalizedPath);
+            FileLogger.Log($"  relativePath=\"{relativePath}\"");
+
+            // 报告下载开始
+            CfReportProviderProgress(connectionKey, transferKey, fileSize, 0);
+
+            // 从服务端下载文件数据
+            byte[] data;
+            try
+            {
+                data = Task.Run(() => _api!.DownloadFileBytesAsync(relativePath, requiredOffset, requiredLength))
+                    .GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log($"  下载失败: {ex.Message}");
+                TransferDataFailure(connectionKey, transferKey);
+                return;
+            }
+
+            FileLogger.Log($"  下载完成: {data.Length} bytes");
+
+            // 报告下载完成
+            CfReportProviderProgress(connectionKey, transferKey, fileSize, requiredOffset + data.Length);
+
+            // 通过 CfExecute + TRANSFER_DATA 将数据传给 Windows
+            var pinnedData = GCHandle.Alloc(data, GCHandleType.Pinned);
+            try
+            {
+                var opInfo = new CF_OPERATION_INFO
+                {
+                    StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
+                    Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
+                    ConnectionKey = connectionKey,
+                    TransferKey = transferKey,
+                    SyncStatus = IntPtr.Zero,
+                    RequestKey = requestKey,
+                };
+
+                var opParams = new CF_OPERATION_PARAMETERS_TRANSFERDATA
+                {
+                    ParamSize = (uint)Marshal.SizeOf<CF_OPERATION_PARAMETERS_TRANSFERDATA>(),
+                    CompletionStatus = 0,  // STATUS_SUCCESS
+                    Buffer = pinnedData.AddrOfPinnedObject(),
+                    Offset = requiredOffset,
+                    Length = data.Length,
+                };
+
+                int hr = CfExecute(in opInfo, ref opParams);
+                FileLogger.Log($"  CfExecute(TRANSFER_DATA) → 0x{hr:X8}");
+            }
+            finally
+            {
+                pinnedData.Free();
+            }
+
+            FileLogger.Log($"  已下载: {relativePath} ({data.Length} bytes)");
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"  FETCH_DATA 异常: {ex.Message}\n{ex.StackTrace}");
+        }
+    }
+
+    /// <summary>
+    /// 通知 Windows 文件下载失败（网络不可用）
+    /// </summary>
+    private static void TransferDataFailure(long connectionKey, long transferKey)
+    {
+        try
+        {
+            var opInfo = new CF_OPERATION_INFO
+            {
+                StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
+                Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
+                ConnectionKey = connectionKey,
+                TransferKey = transferKey,
+                SyncStatus = IntPtr.Zero,
+            };
+
+            var opParams = new CF_OPERATION_PARAMETERS_TRANSFERDATA
+            {
+                ParamSize = (uint)Marshal.SizeOf<CF_OPERATION_PARAMETERS_TRANSFERDATA>(),
+                CompletionStatus = unchecked((int)0xC000CF06),  // STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE
+                Buffer = IntPtr.Zero,
+                Offset = 0,
+                Length = 0,
+            };
+
+            CfExecute(in opInfo, ref opParams);
+        }
+        catch { }
     }
 
     /// <summary>

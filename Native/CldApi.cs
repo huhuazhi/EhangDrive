@@ -28,6 +28,18 @@ internal static class CldApi
         in CF_OPERATION_INFO OpInfo,
         ref CF_OPERATION_PARAMETERS OpParams);
 
+    [DllImport("cldapi.dll", ExactSpelling = true)]
+    public static extern int CfExecute(
+        in CF_OPERATION_INFO OpInfo,
+        ref CF_OPERATION_PARAMETERS_TRANSFERDATA OpParams);
+
+    [DllImport("cldapi.dll", ExactSpelling = true)]
+    public static extern int CfReportProviderProgress(
+        long ConnectionKey,
+        long TransferKey,
+        long TotalSize,
+        long CompletedSize);
+
     [DllImport("cldapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
     public static extern int CfSetInSyncState(
         IntPtr FileHandle,
@@ -220,6 +232,7 @@ internal static class CldApi
     public static class CallbackInfoReader
     {
         public static long GetConnectionKey(IntPtr info) => Marshal.ReadInt64(info, 8);
+        public static long GetFileSize(IntPtr info) => Marshal.ReadInt64(info, 80);
         public static long GetTransferKey(IntPtr info) => Marshal.ReadInt64(info, 112);
         public static IntPtr GetNormalizedPath(IntPtr info) => Marshal.ReadIntPtr(info, 104);
         public static IntPtr GetCorrelationVector(IntPtr info) => Marshal.ReadIntPtr(info, 128);
@@ -294,6 +307,49 @@ internal static class CldApi
         public IntPtr PlaceholderArray;     // CF_PLACEHOLDER_CREATE_INFO*
         public uint PlaceholderCount;
         public uint EntriesProcessed;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  CF_CALLBACK_PARAMETERS — FetchData 变体（用于解析回调参数）
+    // ═══════════════════════════════════════════════════════════════
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CF_CALLBACK_FETCHDATA_BODY
+    {
+        public uint Flags;                  // CF_CALLBACK_FETCH_DATA_FLAGS
+        // 4 bytes auto-padding for alignment
+        public long RequiredFileOffset;
+        public long RequiredLength;
+        public long OptionalFileOffset;
+        public long OptionalLength;
+        public long LastDehydrationTime;
+        public uint LastDehydrationReason;  // CF_CALLBACK_DEHYDRATION_REASON
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CF_CALLBACK_PARAMETERS_FETCHDATA
+    {
+        public uint ParamSize;
+        public uint Padding;                // 对齐 union 到 8 字节
+        public CF_CALLBACK_FETCHDATA_BODY FetchData;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  CF_OPERATION_PARAMETERS — TransferData 变体 (x64)
+    //  与 TransferPlaceholders 是同一个 union 的不同分支，单独定义结构体。
+    // ═══════════════════════════════════════════════════════════════
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CF_OPERATION_PARAMETERS_TRANSFERDATA
+    {
+        public uint ParamSize;
+        public uint _padding;               // 对齐 union 到 8 字节
+        // union TransferData:
+        public uint Flags;                  // CF_OPERATION_TRANSFER_DATA_FLAGS
+        public int CompletionStatus;        // NTSTATUS
+        public IntPtr Buffer;               // LPCVOID (pinned byte[])
+        public long Offset;                 // LARGE_INTEGER
+        public long Length;                 // LARGE_INTEGER
     }
 
     // ═══════════════════════════════════════════════════════════════
