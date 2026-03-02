@@ -149,9 +149,9 @@ public sealed class ModListPollingService : IDisposable
 
         if (cloudMtime > localMtime)
         {
-            // 云端更新 → 脱水本地文件
+            // 云端更新 → 更新元数据并脱水本地文件
             FileLogger.Log($"ModList: 云端更新，脱水本地: {item.Path} (cloud={cloudMtime}, local={localMtime})");
-            DehydrateFile(localPath);
+            UpdateAndDehydrateFile(localPath, item.Mtime, item.Size);
             SyncStatusManager.Instance.AddLog("☁️", $"云端已更新: {item.Path}");
         }
         else if (localMtime > cloudMtime)
@@ -171,13 +171,14 @@ public sealed class ModListPollingService : IDisposable
     }
 
     /// <summary>
-    /// 脱水指定文件（清除本地数据，变回白云占位符）
+    /// 更新占位符元数据（文件大小、修改时间）并脱水。
+    /// 使用 CfUpdatePlaceholder 一次性完成，确保下次 hydrate 时 Windows 使用正确的文件大小。
     /// </summary>
-    private static void DehydrateFile(string fullPath)
+    private static void UpdateAndDehydrateFile(string fullPath, long cloudMtimeUnix, long cloudSize)
     {
         IntPtr handle = CreateFileW(
             fullPath,
-            0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+            0x00000182, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA
             0x00000007, // FILE_SHARE_READ | WRITE | DELETE
             IntPtr.Zero,
             3,          // OPEN_EXISTING
@@ -186,25 +187,41 @@ public sealed class ModListPollingService : IDisposable
 
         if (handle == IntPtr.Zero || handle == new IntPtr(-1))
         {
-            FileLogger.Log($"  DehydrateFile: 无法打开句柄: {fullPath}");
+            FileLogger.Log($"  UpdateAndDehydrate: 无法打开句柄: {fullPath}");
             return;
         }
 
         try
         {
-            int hr = CfDehydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
+            long fileTime = DateTimeOffset.FromUnixTimeSeconds(cloudMtimeUnix).ToFileTime();
+            var metadata = new CF_FS_METADATA
+            {
+                BasicInfo_CreationTime = fileTime,
+                BasicInfo_LastAccessTime = fileTime,
+                BasicInfo_LastWriteTime = fileTime,
+                BasicInfo_ChangeTime = fileTime,
+                BasicInfo_FileAttributes = FILE_ATTRIBUTE_NORMAL,
+                FileSize = cloudSize,
+            };
+
+            int hr = CfUpdatePlaceholder(
+                handle,
+                in metadata,
+                IntPtr.Zero,    // FileIdentity - 保持不变
+                0,
+                IntPtr.Zero,    // DehydrateRangeArray
+                0,              // DehydrateRangeCount
+                CF_UPDATE_FLAGS.CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAGS.CF_UPDATE_FLAG_MARK_IN_SYNC,
+                IntPtr.Zero,    // UpdateUsn
+                IntPtr.Zero);   // Overlapped
+
             if (hr >= 0)
             {
-                FileLogger.Log($"  DehydrateFile: 已脱水: {fullPath}");
-                // 脱水后恢复 IN_SYNC 状态
-                CfSetInSyncState(handle,
-                    CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
-                    CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
-                    IntPtr.Zero);
+                FileLogger.Log($"  UpdateAndDehydrate: 已更新元数据并脱水: {fullPath} (size={cloudSize})");
             }
             else
             {
-                FileLogger.Log($"  DehydrateFile: 失败 0x{(uint)hr:X8}: {fullPath}");
+                FileLogger.Log($"  UpdateAndDehydrate: 失败 0x{(uint)hr:X8}: {fullPath}");
             }
         }
         finally

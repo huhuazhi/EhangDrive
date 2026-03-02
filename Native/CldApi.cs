@@ -73,6 +73,18 @@ internal static class CldApi
         IntPtr Overlapped);
 
     [DllImport("cldapi.dll", ExactSpelling = true)]
+    public static extern int CfUpdatePlaceholder(
+        IntPtr FileHandle,
+        in CF_FS_METADATA FsMetadata,
+        IntPtr FileIdentity,
+        uint FileIdentityLength,
+        IntPtr DehydrateRangeArray,
+        uint DehydrateRangeCount,
+        CF_UPDATE_FLAGS UpdateFlags,
+        IntPtr UpdateUsn,
+        IntPtr Overlapped);
+
+    [DllImport("cldapi.dll", ExactSpelling = true)]
     public static extern int CfGetPlaceholderInfo(
         IntPtr FileHandle,
         uint InfoClass,
@@ -176,6 +188,19 @@ internal static class CldApi
     {
         CF_CREATE_FLAG_NONE = 0x00000000,
         CF_CREATE_FLAG_STOP_ON_ERROR = 0x00000001,
+    }
+
+    [Flags]
+    public enum CF_UPDATE_FLAGS : uint
+    {
+        CF_UPDATE_FLAG_NONE = 0x00000000,
+        CF_UPDATE_FLAG_VERIFY_IN_SYNC = 0x00000001,
+        CF_UPDATE_FLAG_MARK_IN_SYNC = 0x00000002,
+        CF_UPDATE_FLAG_DEHYDRATE = 0x00000004,
+        CF_UPDATE_FLAG_ENABLE_ON_DEMAND_POPULATION = 0x00000008,
+        CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION = 0x00000010,
+        CF_UPDATE_FLAG_REMOVE_FILE_IDENTITY = 0x00000020,
+        CF_UPDATE_FLAG_CLEAR_IN_SYNC = 0x00000040,
     }
 
     // ═══════════════════════════════════════════════════════════════
