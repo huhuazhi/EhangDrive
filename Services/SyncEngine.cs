@@ -91,6 +91,18 @@ public sealed class SyncEngine : IDisposable
     public int PendingCount => _pendingEventCount + _uploadingFiles.Count;
 
     /// <summary>
+    /// 事件处理完成后减计数，如果全部完成则刷新脏目录
+    /// </summary>
+    private void DecrementAndTryFlush()
+    {
+        Interlocked.Decrement(ref _pendingEventCount);
+        if (PendingCount == 0 && HasDirtyDirectories)
+        {
+            FlushDirtyDirectories();
+        }
+    }
+
+    /// <summary>
     /// 生产者入口：丢一个同步事件进来，立即返回
     /// </summary>
     public void Enqueue(SyncEvent evt)
@@ -133,7 +145,7 @@ public sealed class SyncEngine : IDisposable
                 {
                     try { await HandleCreateDirectory(evt); }
                     catch (Exception ex) { SyncStatusManager.Instance.AddLog("❌", $"处理异常: {ex.Message}"); }
-                    finally { Interlocked.Decrement(ref _pendingEventCount); }
+                    finally { DecrementAndTryFlush(); }
                 });
                 break;
             case SyncEventType.RenameItem:
@@ -146,7 +158,7 @@ public sealed class SyncEngine : IDisposable
                 {
                     try { await HandleCreateFile(evt); }
                     catch (Exception ex) { SyncStatusManager.Instance.AddLog("❌", $"处理异常: {ex.Message}"); }
-                    finally { Interlocked.Decrement(ref _pendingEventCount); }
+                    finally { DecrementAndTryFlush(); }
                 });
                 break;
             case SyncEventType.ModifyFile:
@@ -155,7 +167,7 @@ public sealed class SyncEngine : IDisposable
                 {
                     try { await HandleModifyFile(evt); }
                     catch (Exception ex) { SyncStatusManager.Instance.AddLog("❌", $"处理异常: {ex.Message}"); }
-                    finally { Interlocked.Decrement(ref _pendingEventCount); }
+                    finally { DecrementAndTryFlush(); }
                 });
                 break;
             case SyncEventType.DeleteItem:
@@ -522,12 +534,7 @@ public sealed class SyncEngine : IDisposable
         {
             _uploadSemaphore.Release();
             _uploadingFiles.TryRemove(relativePath, out _);
-
-            // 所有上传完成后，直接刷新脏目录（比依赖 Timer 更可靠）
-            if (PendingCount == 0 && HasDirtyDirectories)
-            {
-                FlushDirtyDirectories();
-            }
+            // FlushDirtyDirectories 由 Task.Run 的 finally 在 Decrement 之后触发
         }
     }
 
