@@ -49,6 +49,9 @@ public sealed class SyncEngine : IDisposable
     // key=relativePath, value=(fullPath, enqueueTicks)
     private readonly ConcurrentDictionary<string, (string fullPath, long ticks)> _pendingDeletes = new(StringComparer.OrdinalIgnoreCase);
 
+    // 并发上传控制：最多同时上传 5 个文件
+    private readonly SemaphoreSlim _uploadSemaphore = new(5, 5);
+
     /// <summary>
     /// 检查路径是否在最近被同步处理过（用于过滤反馈事件）
     /// </summary>
@@ -115,10 +118,20 @@ public sealed class SyncEngine : IDisposable
                 await HandleRename(evt);
                 break;
             case SyncEventType.CreateFile:
-                await HandleCreateFile(evt);
+                // 并发处理：不阻塞消费者，由信号量控制并发数
+                _ = Task.Run(async () =>
+                {
+                    try { await HandleCreateFile(evt); }
+                    catch (Exception ex) { SyncStatusManager.Instance.AddLog("❌", $"处理异常: {ex.Message}"); }
+                });
                 break;
             case SyncEventType.ModifyFile:
-                await HandleModifyFile(evt);
+                // 并发处理
+                _ = Task.Run(async () =>
+                {
+                    try { await HandleModifyFile(evt); }
+                    catch (Exception ex) { SyncStatusManager.Instance.AddLog("❌", $"处理异常: {ex.Message}"); }
+                });
                 break;
             case SyncEventType.DeleteItem:
                 await HandleDelete(evt);
@@ -388,14 +401,18 @@ public sealed class SyncEngine : IDisposable
             return;
         }
 
-        // 在 UI 传输列表中显示
+        // 在 UI 传输列表中显示（等待状态）
         var transferItem = new TransferItem
         {
             FileName = relativePath,
             Direction = TransferDirection.Upload,
-            Status = TransferStatus.Transferring,
+            Status = TransferStatus.Waiting,
         };
         SyncStatusManager.Instance.AddTransfer(transferItem);
+
+        // 获取上传槽位（最多 5 个并发上传）
+        await _uploadSemaphore.WaitAsync();
+        transferItem.Status = TransferStatus.Transferring;
 
         try
         {
@@ -474,6 +491,7 @@ public sealed class SyncEngine : IDisposable
         }
         finally
         {
+            _uploadSemaphore.Release();
             _uploadingFiles.TryRemove(relativePath, out _);
         }
     }
@@ -674,5 +692,6 @@ public sealed class SyncEngine : IDisposable
         _cts.Cancel();
         try { _consumerTask.Wait(TimeSpan.FromSeconds(2)); } catch { }
         _cts.Dispose();
+        _uploadSemaphore.Dispose();
     }
 }
