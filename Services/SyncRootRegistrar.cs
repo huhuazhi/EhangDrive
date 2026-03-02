@@ -23,10 +23,12 @@ public static class SyncRootRegistrar
         // 生成唯一的同步根 ID
         var syncRootId = BuildSyncRootId(username);
 
-        // 先取消旧注册（策略可能已变更）
+        // 如果已注册，跳过重新注册以保留文件的 in-sync 状态（绿勾不变蓝圈）
+        // StorageProviderSyncRootManager.Register 支持更新已有注册，无需先 Unregister
         if (IsRegistered(syncRootId))
         {
-            try { StorageProviderSyncRootManager.Unregister(syncRootId); } catch { }
+            FileLogger.Log($"同步根已注册，跳过: {syncRootId}");
+            return;
         }
 
         var info = new StorageProviderSyncRootInfo
