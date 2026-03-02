@@ -130,6 +130,10 @@ public partial class App : Application
 
         // ──── 启动同步引擎 + 文件监听 ───────────────────────────
         _syncEngine = new SyncEngine(api, newConfig.SyncFolder);
+
+        // 恢复已有 placeholder 文件的 IN_SYNC 状态（防止重启后绿勾变蓝圈）
+        _syncEngine.RestoreInSyncState();
+
         _fileWatcher = new FileWatcherService(newConfig.SyncFolder, _syncEngine);
         _fileWatcher.Start();
         FileLogger.Log($"同步引擎+文件监听 已启动, folder={newConfig.SyncFolder}");
