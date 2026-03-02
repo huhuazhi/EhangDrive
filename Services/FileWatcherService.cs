@@ -150,8 +150,9 @@ public sealed class FileWatcherService : IDisposable
     {
         FileLogger.Log($"FileWatcher.Deleted: {e.FullPath}");
 
-        // 过滤反馈事件
-        if (_engine.IsRecentlySynced(e.FullPath)) return;
+        // 注意：这里不检查 IsRecentlySynced！
+        // CfConvertToPlaceholder 不会触发 Delete 事件，Delete 一定是用户真实操作。
+        // _pendingDeletes 3秒延迟已足够防止 move 场景下的误删。
 
         var relativePath = Path.GetRelativePath(_syncFolder, e.FullPath)
                                .Replace('\\', '/');
