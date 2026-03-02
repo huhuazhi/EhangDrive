@@ -595,9 +595,12 @@ public sealed class SyncEngine : IDisposable
             // 通知 Explorer 刷新文件图标覆盖（解决蓝圈不自动变绿勾的问题）
             SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, fullPath);
 
-            // 子文件/子目录转 placeholder 后，Windows 会清除父目录的 IN_SYNC 状态（变白云）
-            // 记录需要刷新的父目录，等所有文件传完后统一批量刷新
-            MarkParentDirectoriesDirty(fullPath);
+            // 只有文件转 placeholder 才会导致父目录 IN_SYNC 被清除（变白云）
+            // 目录本身不需要标记，避免 flush 时反而覆盖已正确的状态
+            if (!isDir)
+            {
+                MarkParentDirectoriesDirty(fullPath);
+            }
         }
         catch (Exception ex)
         {
