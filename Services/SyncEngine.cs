@@ -273,15 +273,6 @@ public sealed class SyncEngine : IDisposable
         // 只处理文件
         if (!File.Exists(evt.FullPath) || Directory.Exists(evt.FullPath)) return;
 
-        // 跳过 placeholder / offline 文件（SetFileInSync 引起的属性变化 / 白云 dehydrated）
-        try
-        {
-            var fi = new FileInfo(evt.FullPath);
-            if (fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint)) return;
-            if (fi.Attributes.HasFlag(System.IO.FileAttributes.Offline)) return;
-        }
-        catch { return; }
-
         // Debounce: 2 秒内同一文件不重复上传
         var now = DateTime.UtcNow.Ticks;
         if (_lastChangedTicks.TryGetValue(evt.RelativePath, out var lastTicks))
@@ -294,9 +285,40 @@ public sealed class SyncEngine : IDisposable
         }
         _lastChangedTicks[evt.RelativePath] = now;
 
-        // 等文件写完
-        await Task.Delay(500);
+        // 等文件写完 + hydrate 完成（placeholder 被修改时需要先 hydrate）
+        await Task.Delay(1000);
         if (!File.Exists(evt.FullPath)) return;
+
+        // 跳过仍为纯 placeholder 的文件（dehydrated 白云文件 / 属性变化 非内容修改）
+        try
+        {
+            var fi = new FileInfo(evt.FullPath);
+            // Offline = cloud-only 白云文件，不需要上传
+            if (fi.Attributes.HasFlag(System.IO.FileAttributes.Offline))
+            {
+                FileLogger.Log($"  跳过 Offline 文件(白云): {evt.RelativePath}");
+                return;
+            }
+            // ReparsePoint 仍在 = hydrate 还没完成或文件未被真正修改
+            // 但要区分：如果 _recentlySynced 中有记录，说明是我们自己刚 ConvertToPlaceholder 触发的
+            if (fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
+            {
+                if (IsRecentlySynced(evt.FullPath))
+                {
+                    FileLogger.Log($"  跳过 placeholder 属性变化(反馈): {evt.RelativePath}");
+                    return;
+                }
+                // 可能是 hydrate 后用户修改尚未完成，再等一下
+                await Task.Delay(1000);
+                fi.Refresh();
+                if (fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
+                {
+                    FileLogger.Log($"  文件仍是 placeholder，跳过: {evt.RelativePath}");
+                    return;
+                }
+            }
+        }
+        catch { return; }
 
         await UploadFileWithRetry(evt.FullPath, evt.RelativePath);
     }
