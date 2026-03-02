@@ -80,9 +80,25 @@ internal static class CldApi
         uint InfoBufferLength,
         out uint ReturnedLength);
 
+    [DllImport("cldapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    public static extern int CfRegisterSyncRoot(
+        [MarshalAs(UnmanagedType.LPWStr)] string SyncRootPath,
+        in CF_SYNC_REGISTRATION Registration,
+        in CF_SYNC_POLICIES Policies,
+        CF_REGISTER_FLAGS RegisterFlags);
+
     // ═══════════════════════════════════════════════════════════════
     //  枚举
     // ═══════════════════════════════════════════════════════════════
+
+    [Flags]
+    public enum CF_REGISTER_FLAGS : uint
+    {
+        CF_REGISTER_FLAG_NONE = 0x00000000,
+        CF_REGISTER_FLAG_UPDATE = 0x00000001,
+        CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT = 0x00000002,
+        CF_REGISTER_FLAG_MARK_IN_SYNC_ON_ROOT = 0x00000004,
+    }
 
     [Flags]
     public enum CF_CONNECT_FLAGS : uint
@@ -161,6 +177,68 @@ internal static class CldApi
         CF_CREATE_FLAG_NONE = 0x00000000,
         CF_CREATE_FLAG_STOP_ON_ERROR = 0x00000001,
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  CfRegisterSyncRoot 相关结构体
+    // ═══════════════════════════════════════════════════════════════
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct CF_SYNC_REGISTRATION
+    {
+        public uint StructSize;
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string ProviderName;
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string ProviderVersion;
+        public IntPtr SyncRootIdentity;
+        public uint SyncRootIdentityLength;
+        public IntPtr FileIdentity;
+        public uint FileIdentityLength;
+        public Guid ProviderId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CF_HYDRATION_POLICY
+    {
+        public ushort Primary;   // CF_HYDRATION_POLICY_PRIMARY
+        public ushort Modifier;  // CF_HYDRATION_POLICY_MODIFIER
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CF_POPULATION_POLICY
+    {
+        public ushort Primary;   // CF_POPULATION_POLICY_PRIMARY
+        public ushort Modifier;  // CF_POPULATION_POLICY_MODIFIER
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CF_SYNC_POLICIES
+    {
+        public uint StructSize;
+        public CF_HYDRATION_POLICY Hydration;
+        public CF_POPULATION_POLICY Population;
+        public uint InSync;     // CF_INSYNC_POLICY flags
+        public uint HardLink;   // CF_HARDLINK_POLICY
+        public uint PlaceholderManagement; // CF_PLACEHOLDER_MANAGEMENT_POLICY
+    }
+
+    // CF_HYDRATION_POLICY_PRIMARY values
+    public const ushort CF_HYDRATION_POLICY_PRIMARY_FULL = 2;
+
+    // CF_HYDRATION_POLICY_MODIFIER flags
+    public const ushort CF_HYDRATION_POLICY_MODIFIER_NONE = 0x0000;
+    public const ushort CF_HYDRATION_POLICY_MODIFIER_VALIDATION_REQUIRED = 0x0002;
+    public const ushort CF_HYDRATION_POLICY_MODIFIER_STREAMING_ALLOWED = 0x0004;
+    public const ushort CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED = 0x0008;
+
+    // CF_POPULATION_POLICY_PRIMARY values
+    public const ushort CF_POPULATION_POLICY_PRIMARY_FULL = 2;
+
+    // CF_INSYNC_POLICY flags
+    public const uint CF_INSYNC_POLICY_NONE = 0x00000000;
+    public const uint CF_INSYNC_POLICY_TRACK_FILE_CREATION_TIME = 0x00000001;
+    public const uint CF_INSYNC_POLICY_TRACK_DIRECTORY_CREATION_TIME = 0x00000010;
+    public const uint CF_INSYNC_POLICY_PRESERVE_INSYNC_FOR_SYNC_ENGINE = 0x80000000;
 
     // ═══════════════════════════════════════════════════════════════
     //  CF_PLACEHOLDER_CREATE_INFO 及相关结构体
@@ -388,6 +466,28 @@ internal static class CldApi
     public static extern int CfExecute(
         in CF_OPERATION_INFO OpInfo,
         ref CF_OPERATION_PARAMETERS_ACKDEHYDRATE OpParams);
+
+    // ═══════════════════════════════════════════════════════════════
+    //  CF_OPERATION_PARAMETERS — AckData 变体 (x64)
+    //  用于 VALIDATE_DATA 回调的 ACK 响应
+    // ═══════════════════════════════════════════════════════════════
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CF_OPERATION_PARAMETERS_ACKDATA
+    {
+        public uint ParamSize;
+        public uint _padding;
+        // union AckData:
+        public uint Flags;                  // CF_OPERATION_ACK_DATA_FLAGS
+        public int CompletionStatus;        // NTSTATUS
+        public long Offset;                 // LARGE_INTEGER
+        public long Length;                 // LARGE_INTEGER
+    }
+
+    [DllImport("cldapi.dll", ExactSpelling = true)]
+    public static extern int CfExecute(
+        in CF_OPERATION_INFO OpInfo,
+        ref CF_OPERATION_PARAMETERS_ACKDATA OpParams);
 
     // ═══════════════════════════════════════════════════════════════
     //  CF_CALLBACK_REGISTRATION

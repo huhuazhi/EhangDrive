@@ -201,6 +201,30 @@ public class SyncApiService
     }
 
     /// <summary>
+    /// 获取单个文件的元数据（mtime, size）。
+    /// 复用 ListDirectoryAsync 获取父目录列表，从中找到目标文件。
+    /// </summary>
+    public async Task<TreeItem?> GetFileMetaAsync(string relativePath)
+    {
+        try
+        {
+            // 取父目录路径
+            int lastSlash = relativePath.LastIndexOf('/');
+            string parentDir = lastSlash > 0 ? relativePath.Substring(0, lastSlash) : "";
+            string fileName = lastSlash >= 0 ? relativePath.Substring(lastSlash + 1) : relativePath;
+
+            var items = await ListDirectoryAsync(parentDir);
+            return items.FirstOrDefault(i =>
+                string.Equals(i.Name, fileName, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"  GetFileMetaAsync 异常: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
     /// 删除服务端文件或目录
     /// </summary>
     public async Task<bool> DeleteAsync(string relativePath)
