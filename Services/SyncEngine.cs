@@ -533,10 +533,12 @@ public sealed class SyncEngine : IDisposable
             Marshal.Copy(identity, 0, identityPtr, identity.Length);
 
             // 转换为 placeholder
+            // 注意：不加 ENABLE_ON_DEMAND_POPULATION！
+            // 此方法处理的是用户本地创建/拷贝的目录，内容已在磁盘上，
+            // 加了会让 Windows 认为"需要从云端按需填充"→ 显示白云图标。
+            // 云端目录的 on-demand population 由 FETCH_PLACEHOLDERS 回调处理。
             var convertFlags = CF_CONVERT_FLAGS.CF_CONVERT_FLAG_MARK_IN_SYNC
                              | CF_CONVERT_FLAGS.CF_CONVERT_FLAG_FORCE_CONVERT_TO_CLOUD_FILE;
-            if (isDir)
-                convertFlags |= CF_CONVERT_FLAGS.CF_CONVERT_FLAG_ENABLE_ON_DEMAND_POPULATION;
 
             int hr = CfConvertToPlaceholder(
                 handle.DangerousGetHandle(),
