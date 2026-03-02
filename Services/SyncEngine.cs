@@ -52,8 +52,8 @@ public sealed class SyncEngine : IDisposable
     // 队列中待处理的事件数（Channel.Reader.Count 在 SingleReader=true 时不可用，所以手动计数）
     private int _pendingEventCount;
 
-    // 并发上传控制：最多同时上传 5 个文件
-    private readonly SemaphoreSlim _uploadSemaphore = new(5, 5);
+    // 并发上传控制：最多同时上传 15 个文件
+    private readonly SemaphoreSlim _uploadSemaphore = new(15, 15);
 
     /// <summary>
     /// 检查路径是否在最近被同步处理过（用于过滤反馈事件）
@@ -122,7 +122,12 @@ public sealed class SyncEngine : IDisposable
         switch (evt.Type)
         {
             case SyncEventType.CreateDirectory:
-                await HandleCreateDirectory(evt);
+                // 目录创建也不阻塞消费者，与文件上传并行处理
+                _ = Task.Run(async () =>
+                {
+                    try { await HandleCreateDirectory(evt); }
+                    catch (Exception ex) { SyncStatusManager.Instance.AddLog("❌", $"处理异常: {ex.Message}"); }
+                });
                 break;
             case SyncEventType.RenameItem:
                 await HandleRename(evt);
@@ -157,8 +162,8 @@ public sealed class SyncEngine : IDisposable
         FileLogger.Log($"HandleCreateDirectory: {evt.RelativePath} ({evt.FullPath})");
 
         // 短暂延迟：用户创建"新建文件夹"后通常会立即重命名
-        // 如果重命名了，原路径就不存在了，由 RenameItem 事件处理
-        await Task.Delay(1500);
+        // 拷贝场景不需要等太久，300ms 足够检测重命名
+        await Task.Delay(300);
 
         if (!Directory.Exists(evt.FullPath))
         {
@@ -248,7 +253,7 @@ public sealed class SyncEngine : IDisposable
         FileLogger.Log($"HandleCreateFile: {evt.RelativePath} ({evt.FullPath})");
 
         // 短暂延迟，等文件写入完成
-        await Task.Delay(500);
+        await Task.Delay(200);
 
         if (!File.Exists(evt.FullPath))
         {
