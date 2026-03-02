@@ -127,10 +127,12 @@ public sealed class FileWatcherService : IDisposable
 
     private void OnChanged(object sender, FileSystemEventArgs e)
     {
-        // FileLogger.Log($"FileWatcher.Changed: {e.FullPath}");
-
-        // 过滤反馈事件
-        if (_engine.IsRecentlySynced(e.FullPath)) return;
+        // 过滤反馋事件（CfConvertToPlaceholder / CfSetInSyncState 触发的属性变化）
+        if (_engine.IsRecentlySynced(e.FullPath))
+        {
+            // FileLogger.Log($"FileWatcher.Changed 跳过(反馋): {e.FullPath}");
+            return;
+        }
 
         // 只处理文件修改（目录的 Changed 忽略）
         if (!File.Exists(e.FullPath) || Directory.Exists(e.FullPath)) return;

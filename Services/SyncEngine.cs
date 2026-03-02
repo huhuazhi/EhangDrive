@@ -55,7 +55,7 @@ public sealed class SyncEngine : IDisposable
     public bool IsRecentlySynced(string fullPath)
     {
         if (_recentlySynced.TryGetValue(fullPath, out var ticks))
-            return (DateTime.UtcNow.Ticks - ticks) < TimeSpan.FromSeconds(10).Ticks;
+            return (DateTime.UtcNow.Ticks - ticks) < TimeSpan.FromSeconds(2).Ticks;
         return false;
     }
 
