@@ -141,6 +141,16 @@ public partial class App : Application
 
         ConfigService.Save(newConfig);
 
+        // ──── 首次全量同步（拉取云端所有占位符）───────────────
+        try
+        {
+            await InitialSyncService.SyncAsync(api, newConfig.SyncFolder);
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"InitialSync 异常: {ex.Message}");
+        }
+
         // ──── 启动同步引擎 + 文件监听 ───────────────────────────
         _syncEngine = new SyncEngine(api, newConfig.SyncFolder);
 
