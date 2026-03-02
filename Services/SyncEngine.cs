@@ -517,7 +517,10 @@ public sealed class SyncEngine : IDisposable
             _uploadingFiles.TryRemove(relativePath, out _);
 
             // 所有上传完成后，直接刷新脏目录（比依赖 Timer 更可靠）
-            if (PendingCount == 0 && HasDirtyDirectories)
+            var pc = PendingCount;
+            var hd = HasDirtyDirectories;
+            FileLogger.Log($"  UploadFinally: PendingCount={pc}, HasDirtyDirectories={hd}");
+            if (pc == 0 && hd)
             {
                 FlushDirtyDirectories();
             }
