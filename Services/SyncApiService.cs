@@ -75,6 +75,12 @@ public class RegisterClientResponse
 
     [JsonPropertyName("client_count")]
     public int ClientCount { get; set; }
+
+    /// <summary>
+    /// 服务端指示该客户端需要重新全量同步（例如之前被删除过）
+    /// </summary>
+    [JsonPropertyName("need_full_sync")]
+    public bool NeedFullSync { get; set; }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -120,9 +126,9 @@ public class SyncApiService
     }
 
     /// <summary>
-    /// 注册客户端，返回当前客户端数量。
+    /// 注册客户端，返回注册响应（包含 client_count 和 need_full_sync）。
     /// </summary>
-    public async Task<int> RegisterClientAsync(string clientId, string hostname, string ip)
+    public async Task<RegisterClientResponse> RegisterClientAsync(string clientId, string hostname, string ip)
     {
         try
         {
@@ -133,17 +139,18 @@ public class SyncApiService
             if (!response.IsSuccessStatusCode)
             {
                 FileLogger.Log($"RegisterClient: HTTP {(int)response.StatusCode}");
-                return 1;
+                return new RegisterClientResponse { ClientCount = 1 };
             }
             var json = await response.Content.ReadAsStringAsync();
-            var result = JsonSerializer.Deserialize<RegisterClientResponse>(json);
-            FileLogger.Log($"RegisterClient: {result?.Message}, client_count={result?.ClientCount}");
-            return result?.ClientCount ?? 1;
+            var result = JsonSerializer.Deserialize<RegisterClientResponse>(json)
+                ?? new RegisterClientResponse { ClientCount = 1 };
+            FileLogger.Log($"RegisterClient: {result.Message}, client_count={result.ClientCount}, need_full_sync={result.NeedFullSync}");
+            return result;
         }
         catch (Exception ex)
         {
             FileLogger.Log($"RegisterClient 异常: {ex.Message}");
-            return 1;
+            return new RegisterClientResponse { ClientCount = 1 };
         }
     }
 

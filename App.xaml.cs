@@ -171,14 +171,33 @@ public partial class App : Application
         var clientId = ConfigService.GetOrCreateClientId();
         var hostname = ConfigService.GetHostname();
         var localIp = ConfigService.GetLocalIp();
-        int clientCount = 1;
+        RegisterClientResponse registerResult;
         try
         {
-            clientCount = await api.RegisterClientAsync(clientId, hostname, localIp);
+            registerResult = await api.RegisterClientAsync(clientId, hostname, localIp);
         }
         catch (Exception ex)
         {
             FileLogger.Log($"RegisterClient 异常: {ex.Message}");
+            registerResult = new RegisterClientResponse { ClientCount = 1 };
+        }
+        int clientCount = registerResult.ClientCount;
+
+        // ──── 服务端要求重新全量同步（被删除后重新注册）─────────
+        if (registerResult.NeedFullSync && initialSyncDone)
+        {
+            FileLogger.Log("服务端要求重新全量同步（该客户端曾被删除）");
+            InitialSyncService.ClearMarker(newConfig.SyncFolder);
+            initialSyncDone = false;
+            try
+            {
+                await InitialSyncService.SyncAsync(api, newConfig.SyncFolder);
+                initialSyncDone = true;
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log($"重新全量同步异常: {ex.Message}");
+            }
         }
 
         // ──── 全量同步完成后且有多客户端时才启动 modlist 轮询 ────
