@@ -193,7 +193,9 @@ public sealed class SyncEngine : IDisposable
 
         if (ok)
         {
-            ConvertToPlaceholderAndSync(evt.FullPath, evt.RelativePath);
+            // 目录不立即转 placeholder（空目录转了也是白云，且子文件上传时会清父 IN_SYNC）
+            // 加入脏目录列表，等所有文件传完后由 FlushDirtyDirectories 统一转 placeholder + IN_SYNC
+            _dirtyDirectories.TryAdd(evt.FullPath, 0);
             SyncStatusManager.Instance.AddLog("✅", $"文件夹已同步: {evt.RelativePath}");
         }
         else
@@ -643,14 +645,35 @@ public sealed class SyncEngine : IDisposable
         {
             try
             {
+                if (!Directory.Exists(dir)) continue;
+
                 using var handle = OpenFileForCldApi(dir);
                 if (handle == null) continue;
 
-                CfSetInSyncState(
+                // 目录可能还不是 placeholder（CreateDirectory 时跳过了转换），先转换
+                var relativePath = dir.Substring(_syncFolder.Length + 1).Replace('\\', '/');
+                byte[] identity = Encoding.UTF8.GetBytes(relativePath);
+                IntPtr identityPtr = Marshal.AllocHGlobal(identity.Length);
+                Marshal.Copy(identity, 0, identityPtr, identity.Length);
+
+                int hr = CfConvertToPlaceholder(
                     handle.DangerousGetHandle(),
-                    CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
-                    CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
-                    IntPtr.Zero);
+                    identityPtr, (uint)identity.Length,
+                    CF_CONVERT_FLAGS.CF_CONVERT_FLAG_MARK_IN_SYNC
+                    | CF_CONVERT_FLAGS.CF_CONVERT_FLAG_FORCE_CONVERT_TO_CLOUD_FILE,
+                    IntPtr.Zero, IntPtr.Zero);
+
+                Marshal.FreeHGlobal(identityPtr);
+
+                // 0x8007017C = 已经是 placeholder，再单独设 IN_SYNC
+                if (hr == unchecked((int)0x8007017C))
+                {
+                    CfSetInSyncState(
+                        handle.DangerousGetHandle(),
+                        CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                        CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                        IntPtr.Zero);
+                }
 
                 SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, dir);
             }
