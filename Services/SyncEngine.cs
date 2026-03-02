@@ -285,41 +285,27 @@ public sealed class SyncEngine : IDisposable
         }
         _lastChangedTicks[evt.RelativePath] = now;
 
-        // 等文件写完 + hydrate 完成（placeholder 被修改时需要先 hydrate）
+        // 等文件写完
         await Task.Delay(1000);
         if (!File.Exists(evt.FullPath)) return;
 
-        // 跳过仍为纯 placeholder 的文件（dehydrated 白云文件 / 属性变化 非内容修改）
         try
         {
             var fi = new FileInfo(evt.FullPath);
-            // Offline = cloud-only 白云文件，不需要上传
+            // Offline = cloud-only 白云文件（未 hydrate），不需要上传
             if (fi.Attributes.HasFlag(System.IO.FileAttributes.Offline))
             {
                 FileLogger.Log($"  跳过 Offline 文件(白云): {evt.RelativePath}");
                 return;
             }
-            // ReparsePoint 仍在 = hydrate 还没完成或文件未被真正修改
-            // 但要区分：如果 _recentlySynced 中有记录，说明是我们自己刚 ConvertToPlaceholder 触发的
-            if (fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
-            {
-                if (IsRecentlySynced(evt.FullPath))
-                {
-                    FileLogger.Log($"  跳过 placeholder 属性变化(反馈): {evt.RelativePath}");
-                    return;
-                }
-                // 可能是 hydrate 后用户修改尚未完成，再等一下
-                await Task.Delay(1000);
-                fi.Refresh();
-                if (fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
-                {
-                    FileLogger.Log($"  文件仍是 placeholder，跳过: {evt.RelativePath}");
-                    return;
-                }
-            }
+            // 注意：不再用 ReparsePoint 判断是否跳过！
+            // Cloud Filter placeholder 被用户修改后 ReparsePoint 仍然保留，
+            // 但内容已经变了，必须重新上传。
+            // 反馈事件已在 OnChanged 中被 IsRecentlySynced(2秒) 过滤。
         }
         catch { return; }
 
+        FileLogger.Log($"  准备上传修改: {evt.RelativePath}");
         await UploadFileWithRetry(evt.FullPath, evt.RelativePath);
     }
 
