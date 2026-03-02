@@ -13,13 +13,23 @@ public partial class App : Application
     private TrayIconService? _trayIcon;
     private SyncEngine? _syncEngine;
     private FileWatcherService? _fileWatcher;
+    private MainWindow? _mainWindow;
+    private string? _currentUsername;
 
     private async void Application_Startup(object sender, StartupEventArgs e)
     {
         // 防止关闭最后一个窗口时退出应用（托盘模式）
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
         FileLogger.Log("========== 应用启动 ==========");
+        await StartSession();
+    }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  会话启动：登录 → 选择同步目录 → 注册 → 连接 → 启动主窗口
+    // ═══════════════════════════════════════════════════════════════
+
+    private async Task StartSession()
+    {
         string? token = null;
         string? server = null;
         string? username = null;
@@ -79,6 +89,8 @@ public partial class App : Application
             newConfig.SyncFolder = selectedFolder;
         }
 
+        _currentUsername = username;
+
         // ──── 注册同步根目录 ─────────────────────────────────────
         try
         {
@@ -122,23 +134,108 @@ public partial class App : Application
         _fileWatcher.Start();
         FileLogger.Log($"同步引擎+文件监听 已启动, folder={newConfig.SyncFolder}");
 
+        // ──── 清空上一轮的日志和传输列表 ─────────────────────────
+        SyncStatusManager.Instance.Clear();
+
         // ──── 创建主窗口 ─────────────────────────────────────────
-        var mainWindow = new MainWindow(newConfig, _connection);
+        _mainWindow = new MainWindow(newConfig, _connection,
+            onLogout: HandleLogout,
+            onChangeSyncFolder: HandleChangeSyncFolder);
 
         // ──── 创建托盘图标 ───────────────────────────────────────
         _trayIcon = new TrayIconService(
             newConfig.SyncFolder,
-            showMainWindow: () => { mainWindow.Show(); mainWindow.Activate(); },
-            showSettings: () => mainWindow.ShowSettingsTab(),
+            showMainWindow: () => { _mainWindow?.Show(); _mainWindow?.Activate(); },
+            showSettings: () => _mainWindow?.ShowSettingsTab(),
             exitApp: () =>
             {
-                _fileWatcher?.Dispose();
-                _syncEngine?.Dispose();
-                _trayIcon?.Dispose();
-                mainWindow.ExitApplication();
+                CleanupSession();
+                _mainWindow?.ExitApplication();
             });
 
-        mainWindow.Show();
+        _mainWindow.Show();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  登出：清理当前会话 → 清除凭据 → 返回登录界面
+    // ═══════════════════════════════════════════════════════════════
+
+    private async void HandleLogout()
+    {
+        FileLogger.Log("用户登出，返回登录界面");
+
+        // 取消同步根注册
+        if (_currentUsername != null)
+        {
+            try { SyncRootRegistrar.Unregister(_currentUsername); }
+            catch (Exception ex) { FileLogger.Log($"Unregister 异常: {ex.Message}"); }
+        }
+
+        // 清理当前会话
+        CleanupSession();
+        _mainWindow?.ForceClose();
+        _mainWindow = null;
+
+        // 修改配置：清除 Token 和 SyncFolder，但保留 AutoLogin 偏好
+        var config = ConfigService.Load();
+        if (config != null)
+        {
+            config.Token = "";
+            config.SyncFolder = null;
+            // 保留 config.AutoLogin，这样用户下次看到登录窗口时勾选状态不变
+            ConfigService.Save(config);
+        }
+
+        // 重新开始会话（会弹出登录窗口 → 选择同步目录）
+        await StartSession();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  更改同步目录：选择新目录 → 清理 → 用新目录重连
+    // ═══════════════════════════════════════════════════════════════
+
+    private async void HandleChangeSyncFolder(string newFolder)
+    {
+        FileLogger.Log($"更改同步目录: {newFolder}");
+
+        // 取消旧同步根注册
+        if (_currentUsername != null)
+        {
+            try { SyncRootRegistrar.Unregister(_currentUsername); }
+            catch (Exception ex) { FileLogger.Log($"Unregister 异常: {ex.Message}"); }
+        }
+
+        // 清理当前会话
+        CleanupSession();
+        _mainWindow?.ForceClose();
+        _mainWindow = null;
+
+        // 更新配置中的同步目录（Token 保留，会自动登录，不弹出登录窗口）
+        var config = ConfigService.Load();
+        if (config != null)
+        {
+            config.SyncFolder = newFolder;
+            ConfigService.Save(config);
+        }
+
+        // 重新开始会话
+        await StartSession();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  清理当前同步会话
+    // ═══════════════════════════════════════════════════════════════
+
+    private void CleanupSession()
+    {
+        _fileWatcher?.Dispose();
+        _fileWatcher = null;
+        _syncEngine?.Dispose();
+        _syncEngine = null;
+        _connection?.Dispose();
+        _connection = null;
+        _trayIcon?.Dispose();
+        _trayIcon = null;
     }
 
     private static string? PickSyncFolder()

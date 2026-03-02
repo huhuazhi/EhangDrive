@@ -14,13 +14,18 @@ public partial class MainWindow : Window
 {
     private readonly LoginConfig _config;
     private readonly SyncProviderConnection _connection;
+    private readonly Action _onLogout;
+    private readonly Action<string> _onChangeSyncFolder;
     private bool _isExiting;
 
-    public MainWindow(LoginConfig config, SyncProviderConnection connection)
+    public MainWindow(LoginConfig config, SyncProviderConnection connection,
+                      Action onLogout, Action<string> onChangeSyncFolder)
     {
         InitializeComponent();
         _config = config;
         _connection = connection;
+        _onLogout = onLogout;
+        _onChangeSyncFolder = onChangeSyncFolder;
 
         // 绑定传输列表和日志
         LvTransfers.ItemsSource = SyncStatusManager.Instance.Transfers;
@@ -54,12 +59,20 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
+    /// 强制关闭窗口（不拦截关闭事件），用于会话重启
+    /// </summary>
+    public void ForceClose()
+    {
+        _isExiting = true;
+        Close();
+    }
+
+    /// <summary>
     /// 真正退出应用（从托盘菜单调用）
     /// </summary>
     public void ExitApplication()
     {
         _isExiting = true;
-        _connection.Dispose();
         Close();
         System.Windows.Application.Current.Shutdown();
     }
@@ -77,34 +90,36 @@ public partial class MainWindow : Window
         tabControl.SelectedIndex = 1;
     }
 
-    // ─── 登出 ─────────────────────────────────────────────────────
+    // ─── 登出 → 返回登录界面 ────────────────────────────────────────
     private void BtnLogout_Click(object sender, RoutedEventArgs e)
     {
         var result = MessageBox.Show(
-            "确定要登出吗？登出后将关闭同步连接并退出程序。",
+            "确定要登出吗？将返回登录界面。",
             "亿航Drive", MessageBoxButton.YesNo, MessageBoxImage.Question);
 
         if (result != MessageBoxResult.Yes) return;
 
-        // 清除保存的 token
-        _config.Token = "";
-        _config.AutoLogin = false;
-        ConfigService.Save(_config);
-
-        // 取消同步根注册
-        SyncRootRegistrar.Unregister(_config.Username);
-
-        _isExiting = true;
-        _connection.Dispose();
-        Close();
-        System.Windows.Application.Current.Shutdown();
+        _onLogout();
     }
 
     // ─── 更改同步目录 ─────────────────────────────────────────────
     private void BtnChangeSyncFolder_Click(object sender, RoutedEventArgs e)
     {
-        MessageBox.Show("更改同步目录需要重新启动程序。\n请先登出，再重新登录选择新目录。",
-            "亿航Drive", MessageBoxButton.OK, MessageBoxImage.Information);
+        using var dialog = new System.Windows.Forms.FolderBrowserDialog
+        {
+            Description = "请选择新的同步文件夹",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = true,
+            SelectedPath = _config.SyncFolder ?? "",
+        };
+
+        if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
+
+        var newFolder = dialog.SelectedPath;
+        if (string.Equals(newFolder, _config.SyncFolder, StringComparison.OrdinalIgnoreCase))
+            return; // 同一目录，无需更改
+
+        _onChangeSyncFolder(newFolder);
     }
 
     // ─── 开机自启动 ───────────────────────────────────────────────

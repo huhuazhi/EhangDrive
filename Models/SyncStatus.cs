@@ -127,5 +127,14 @@ public class SyncStatusManager : INotifyPropertyChanged
         });
     }
 
+    public void Clear()
+    {
+        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        {
+            Transfers.Clear();
+            Logs.Clear();
+        });
+    }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 }
