@@ -141,11 +141,12 @@ public partial class App : Application
 
         ConfigService.Save(newConfig);
 
-        // ──── 启动同步引擎 + 文件监听 ───────────────────────────
+        // ──── 启动同步引擎（文件监听在全量同步完成后启动）───────
         _syncEngine = new SyncEngine(api, newConfig.SyncFolder);
 
         _fileWatcher = new FileWatcherService(newConfig.SyncFolder, _syncEngine);
-        _fileWatcher.Start();
+        // 注意：_fileWatcher.Start() 延迟到全量同步完成后调用
+        // 避免全量同步中的文件操作（删除旧文件→重建占位符）被误识别为用户操作
 
         // ──── 首次全量同步（如果尚未完成）──────────────────────
         bool initialSyncDone = InitialSyncService.IsCompleted(newConfig.SyncFolder);
@@ -199,6 +200,10 @@ public partial class App : Application
                 FileLogger.Log($"重新全量同步异常: {ex.Message}");
             }
         }
+
+        // ──── 全量同步完成后启动文件监听 ────────────────────────
+        _fileWatcher.Start();
+        FileLogger.Log("FileWatcher 已启动（全量同步完成后）");
 
         // ──── 全量同步完成后且有多客户端时才启动 modlist 轮询 ────
         if (initialSyncDone && clientCount >= 2)

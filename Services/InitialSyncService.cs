@@ -40,14 +40,18 @@ public static class InitialSyncService
         int totalFiles = 0;
         int totalDirs = 0;
         int totalCreated = 0;
+        int totalReplaced = 0;
+        int totalUploaded = 0;
 
         try
         {
             // 从根目录开始递归
-            var (files, dirs, created) = await SyncDirectoryRecursive(api, syncFolder, "");
+            var (files, dirs, created, replaced, uploaded) = await SyncDirectoryRecursive(api, syncFolder, "");
             totalFiles = files;
             totalDirs = dirs;
             totalCreated = created;
+            totalReplaced = replaced;
+            totalUploaded = uploaded;
         }
         catch (Exception ex)
         {
@@ -55,8 +59,8 @@ public static class InitialSyncService
         }
 
         sw.Stop();
-        FileLogger.Log($"InitialSync: 完成 - 扫描 {totalDirs} 个目录, {totalFiles} 个文件, 新建 {totalCreated} 个占位符, 耗时 {sw.ElapsedMilliseconds}ms");
-        SyncStatusManager.Instance.AddLog("🔄", $"全量同步完成: {totalDirs}个目录, {totalFiles}个文件, 新建{totalCreated}个占位符");
+        FileLogger.Log($"InitialSync: 完成 - 扫描 {totalDirs} 个目录, {totalFiles} 个文件, 新建 {totalCreated} 个占位符, 替换 {totalReplaced} 个(服务器更新), 上传 {totalUploaded} 个(本地更新), 耗时 {sw.ElapsedMilliseconds}ms");
+        SyncStatusManager.Instance.AddLog("🔄", $"全量同步完成: {totalDirs}个目录, {totalFiles}个文件, 新建{totalCreated}, 替换{totalReplaced}, 上传{totalUploaded}");
 
         // 写入完成标记（只有成功走到这里才写入，中途异常/关机不会写入）
         WriteCompletionMarker(syncFolder);
@@ -105,9 +109,10 @@ public static class InitialSyncService
 
     /// <summary>
     /// 递归同步一个目录：列出云端内容，创建缺失的占位符，然后递归子目录。
-    /// 返回 (文件数, 目录数, 新建占位符数)
+    /// 对本地已存在的文件，比较时间戳：服务器更新则替换为占位符，本地更新则上传到服务器。
+    /// 返回 (文件数, 目录数, 新建占位符数, 替换数, 上传数)
     /// </summary>
-    private static async Task<(int files, int dirs, int created)> SyncDirectoryRecursive(
+    private static async Task<(int files, int dirs, int created, int replaced, int uploaded)> SyncDirectoryRecursive(
         SyncApiService api, string syncFolder, string relativePath)
     {
         // 列出云端该目录下的内容
@@ -119,10 +124,10 @@ public static class InitialSyncService
         catch (Exception ex)
         {
             FileLogger.Log($"InitialSync: 列目录失败 \"{relativePath}\" - {ex.Message}");
-            return (0, 0, 0);
+            return (0, 0, 0, 0, 0);
         }
 
-        if (items.Count == 0) return (0, 1, 0);
+        if (items.Count == 0) return (0, 1, 0, 0, 0);
 
         // 本地目录完整路径
         string localDir = string.IsNullOrEmpty(relativePath)
@@ -132,9 +137,11 @@ public static class InitialSyncService
         // 确保本地目录存在
         Directory.CreateDirectory(localDir);
 
-        // 筛选出本地还不存在的条目（需要创建占位符的）
-        var toCreate = new List<TreeItem>();
+        // 筛选出需要处理的条目
+        var toCreate = new List<TreeItem>();                         // 本地不存在，需创建占位符
+        var toUpload = new List<(string localPath, string relPath)>(); // 本地更新，需上传
         var subDirs = new List<(string name, string relPath)>();
+        int replaced = 0;
 
         foreach (var item in items)
         {
@@ -155,10 +162,51 @@ public static class InitialSyncService
             }
             else
             {
-                // 文件：如果本地不存在，需要创建占位符
+                // 文件
                 if (!File.Exists(childLocalPath))
                 {
+                    // 本地不存在 → 创建占位符
                     toCreate.Add(item);
+                }
+                else
+                {
+                    // 本地已存在 → 比较修改时间，哪个新用哪个
+                    try
+                    {
+                        var localMtime = new DateTimeOffset(File.GetLastWriteTimeUtc(childLocalPath));
+                        var serverMtime = DateTimeOffset.FromUnixTimeSeconds(item.Mtime);
+
+                        if (serverMtime > localMtime.AddSeconds(2))
+                        {
+                            // 服务器更新 → 删除本地旧文件，重新创建占位符
+                            try
+                            {
+                                // 去掉只读属性以确保可删除
+                                var attrs = File.GetAttributes(childLocalPath);
+                                if (attrs.HasFlag(System.IO.FileAttributes.ReadOnly))
+                                    File.SetAttributes(childLocalPath, attrs & ~System.IO.FileAttributes.ReadOnly);
+                                File.Delete(childLocalPath);
+                                toCreate.Add(item);
+                                replaced++;
+                                FileLogger.Log($"InitialSync: 服务器更新，替换本地文件: {childRelPath} (本地={localMtime:u} 服务器={serverMtime:u})");
+                            }
+                            catch (Exception ex)
+                            {
+                                FileLogger.Log($"InitialSync: 删除旧文件失败 {childRelPath}: {ex.Message}");
+                            }
+                        }
+                        else if (localMtime > serverMtime.AddSeconds(2))
+                        {
+                            // 本地更新 → 需要上传到服务器
+                            toUpload.Add((childLocalPath, childRelPath));
+                            FileLogger.Log($"InitialSync: 本地更新，需上传: {childRelPath} (本地={localMtime:u} 服务器={serverMtime:u})");
+                        }
+                        // else: 时间戳接近（差值≤2秒），视为相同，跳过
+                    }
+                    catch (Exception ex)
+                    {
+                        FileLogger.Log($"InitialSync: 比较文件时间失败 {childRelPath}: {ex.Message}");
+                    }
                 }
             }
         }
@@ -169,16 +217,41 @@ public static class InitialSyncService
             created = CreatePlaceholders(localDir, relativePath, toCreate);
         }
 
+        // 上传本地更新的文件到服务器
+        int uploaded = 0;
+        foreach (var (localPath, relPath) in toUpload)
+        {
+            try
+            {
+                bool ok = await api.UploadFileAsync(relPath, localPath);
+                if (ok)
+                {
+                    uploaded++;
+                    FileLogger.Log($"InitialSync: 已上传本地更新文件: {relPath}");
+                }
+                else
+                {
+                    FileLogger.Log($"InitialSync: 上传失败(HTTP错误): {relPath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log($"InitialSync: 上传异常 {relPath}: {ex.Message}");
+            }
+        }
+
         int fileCount = items.Count(i => !i.IsDir);
         int dirCount = 1; // 当前目录
 
         // 递归处理子目录
         foreach (var (name, relPath) in subDirs)
         {
-            var (subFiles, subDirs2, subCreated) = await SyncDirectoryRecursive(api, syncFolder, relPath);
+            var (subFiles, subDirs2, subCreated, subReplaced, subUploaded) = await SyncDirectoryRecursive(api, syncFolder, relPath);
             fileCount += subFiles;
             dirCount += subDirs2;
             created += subCreated;
+            replaced += subReplaced;
+            uploaded += subUploaded;
         }
 
         // 确保当前目录为 IN_SYNC 状态
@@ -187,7 +260,7 @@ public static class InitialSyncService
             SetItemInSync(localDir);
         }
 
-        return (fileCount, dirCount, created);
+        return (fileCount, dirCount, created, replaced, uploaded);
     }
 
     /// <summary>
