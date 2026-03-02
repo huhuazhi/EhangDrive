@@ -497,18 +497,11 @@ public sealed class SyncEngine : IDisposable
     }
 
     /// <summary>
-    /// 跳过不需要同步的路径（.git, node_modules, desktop.ini 等）
+    /// 跳过不需要同步的路径（当前不过滤任何文件）
     /// </summary>
     public static bool ShouldSkipPath(string relativePath)
     {
-        var parts = relativePath.Replace('\\', '/').Split('/');
-        foreach (var p in parts)
-        {
-            if (p is ".git" or ".svn" or ".hg" or "node_modules")
-                return true;
-        }
-        var name = parts[^1];
-        return name is ".DS_Store" or "desktop.ini" or "Thumbs.db";
+        return false;
     }
 
     private static string FormatSpeed(long uploaded, long total)
