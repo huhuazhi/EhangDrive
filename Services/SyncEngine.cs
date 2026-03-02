@@ -510,6 +510,9 @@ public sealed class SyncEngine : IDisposable
                 IntPtr.Zero);
 
             FileLogger.Log($"  CfSetInSyncState → 0x{hr:X8}");
+
+            // 通知 Explorer 刷新文件图标覆盖（解决蓝圈不自动变绿勾的问题）
+            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, fullPath);
         }
         catch (Exception ex)
         {
@@ -544,6 +547,16 @@ public sealed class SyncEngine : IDisposable
             return null;
         }
     }
+
+    // SHChangeNotify 常量
+    private const uint SHCNE_UPDATEITEM = 0x00002000;
+    private const uint SHCNF_PATHW = 0x0005;
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern void SHChangeNotify(
+        uint wEventId, uint uFlags,
+        [MarshalAs(UnmanagedType.LPWStr)] string? dwItem1,
+        IntPtr dwItem2 = default);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateFileW(
