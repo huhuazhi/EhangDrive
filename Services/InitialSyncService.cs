@@ -10,11 +10,27 @@ namespace EhangNAS_Sync.Services;
 /// 首次启动全量同步：递归遍历云端目录树，
 /// 用 CfCreatePlaceholders 批量创建所有占位符。
 /// 确保用户打开同步文件夹时能立即看到完整的文件列表。
+/// 
+/// 完成后写入标记文件，下次启动时跳过全量同步。
+/// 如果中途中断（关机/崩溃），标记未写入，下次启动会自动继续。
 /// </summary>
 public static class InitialSyncService
 {
+    private static readonly string StateDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "YihangDrive");
+
+    /// <summary>
+    /// 检查指定同步目录的全量同步是否已完成。
+    /// </summary>
+    public static bool IsCompleted(string syncFolder)
+    {
+        return File.Exists(GetMarkerPath(syncFolder));
+    }
+
     /// <summary>
     /// 执行全量同步。递归遍历云端目录树，为不存在的文件/目录创建占位符。
+    /// 成功完成后写入标记文件。
     /// </summary>
     public static async Task SyncAsync(SyncApiService api, string syncFolder)
     {
@@ -41,6 +57,50 @@ public static class InitialSyncService
         sw.Stop();
         FileLogger.Log($"InitialSync: 完成 - 扫描 {totalDirs} 个目录, {totalFiles} 个文件, 新建 {totalCreated} 个占位符, 耗时 {sw.ElapsedMilliseconds}ms");
         SyncStatusManager.Instance.AddLog("🔄", $"全量同步完成: {totalDirs}个目录, {totalFiles}个文件, 新建{totalCreated}个占位符");
+
+        // 写入完成标记（只有成功走到这里才写入，中途异常/关机不会写入）
+        WriteCompletionMarker(syncFolder);
+    }
+
+    /// <summary>
+    /// 获取标记文件路径，绑定到具体同步目录（不同目录独立跟踪）。
+    /// </summary>
+    private static string GetMarkerPath(string syncFolder)
+    {
+        // 用同步目录路径的哈希做文件名，避免路径字符问题
+        var hash = syncFolder.ToLowerInvariant().GetHashCode();
+        return Path.Combine(StateDir, $"initial_sync_done_{hash:X8}.marker");
+    }
+
+    /// <summary>
+    /// 写入完成标记文件。
+    /// </summary>
+    private static void WriteCompletionMarker(string syncFolder)
+    {
+        try
+        {
+            Directory.CreateDirectory(StateDir);
+            File.WriteAllText(GetMarkerPath(syncFolder), 
+                $"completed={DateTime.UtcNow:O}\nfolder={syncFolder}");
+            FileLogger.Log("InitialSync: 已写入完成标记");
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"InitialSync: 写入标记失败 - {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 删除完成标记（换目录或登出时调用）。
+    /// </summary>
+    public static void ClearMarker(string syncFolder)
+    {
+        try
+        {
+            var path = GetMarkerPath(syncFolder);
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch { }
     }
 
     /// <summary>

@@ -141,26 +141,44 @@ public partial class App : Application
 
         ConfigService.Save(newConfig);
 
-        // ──── 首次全量同步（拉取云端所有占位符）───────────────
-        try
-        {
-            await InitialSyncService.SyncAsync(api, newConfig.SyncFolder);
-        }
-        catch (Exception ex)
-        {
-            FileLogger.Log($"InitialSync 异常: {ex.Message}");
-        }
-
         // ──── 启动同步引擎 + 文件监听 ───────────────────────────
         _syncEngine = new SyncEngine(api, newConfig.SyncFolder);
 
         _fileWatcher = new FileWatcherService(newConfig.SyncFolder, _syncEngine);
         _fileWatcher.Start();
 
-        // ──── 启动 modlist 轮询（检测其他客户端的文件修改）────
-        _modListPoller = new ModListPollingService(api, newConfig.SyncFolder, _syncEngine);
+        // ──── 首次全量同步（如果尚未完成）──────────────────────
+        bool initialSyncDone = InitialSyncService.IsCompleted(newConfig.SyncFolder);
+        if (!initialSyncDone)
+        {
+            FileLogger.Log("InitialSync: 未完成标记，执行全量同步...");
+            try
+            {
+                await InitialSyncService.SyncAsync(api, newConfig.SyncFolder);
+                initialSyncDone = true;
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log($"InitialSync 异常: {ex.Message}");
+            }
+        }
+        else
+        {
+            FileLogger.Log("InitialSync: 已完成，跳过全量同步");
+        }
 
-        FileLogger.Log($"同步引擎+文件监听+modlist轮询 已启动, folder={newConfig.SyncFolder}");
+        // ──── 全量同步完成后才启动 modlist 轮询 ─────────────────
+        if (initialSyncDone)
+        {
+            _modListPoller = new ModListPollingService(api, newConfig.SyncFolder, _syncEngine);
+            FileLogger.Log("ModListPollingService 已启动（全量同步完成后）");
+        }
+        else
+        {
+            FileLogger.Log("ModListPollingService 未启动（全量同步未完成）");
+        }
+
+        FileLogger.Log($"同步引擎+文件监听 已启动, folder={newConfig.SyncFolder}");
 
         // ──── 清空上一轮的日志和传输列表 ─────────────────────────
         SyncStatusManager.Instance.Clear();
@@ -192,6 +210,11 @@ public partial class App : Application
     private async void HandleLogout()
     {
         FileLogger.Log("用户登出，返回登录界面");
+
+        // 清除全量同步标记（登出后换账号/重新选目录需要重新同步）
+        var oldConfig = ConfigService.Load();
+        if (oldConfig?.SyncFolder != null)
+            InitialSyncService.ClearMarker(oldConfig.SyncFolder);
 
         // 取消同步根注册
         if (_currentUsername != null)
@@ -226,6 +249,11 @@ public partial class App : Application
     private async void HandleChangeSyncFolder(string newFolder)
     {
         FileLogger.Log($"更改同步目录: {newFolder}");
+
+        // 清除旧目录的全量同步标记（新目录需要重新全量同步）
+        var oldConf = ConfigService.Load();
+        if (oldConf?.SyncFolder != null)
+            InitialSyncService.ClearMarker(oldConf.SyncFolder);
 
         // 取消旧同步根注册
         if (_currentUsername != null)
