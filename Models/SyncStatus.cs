@@ -47,8 +47,16 @@ public class TransferItem : INotifyPropertyChanged
     public TransferStatus Status
     {
         get => _status;
-        set { _status = value; OnPropertyChanged(); OnPropertyChanged(nameof(StatusText)); }
+        set { _status = value; OnPropertyChanged(); OnPropertyChanged(nameof(StatusText)); OnPropertyChanged(nameof(StatusColor)); }
     }
+
+    /// <summary>进度条颜色：传输中蓝色、已完成绿色、失败红色</summary>
+    public string StatusColor => Status switch
+    {
+        TransferStatus.Completed => "#27AE60",
+        TransferStatus.Failed => "#E74C3C",
+        _ => "#1A73E8"
+    };
 
     public string StatusText => Status switch
     {
@@ -116,6 +124,9 @@ public class SyncStatusManager : INotifyPropertyChanged
         System.Windows.Application.Current?.Dispatcher.Invoke(() =>
         {
             Transfers.Insert(0, item);
+            // 最多保留 50 条传输历史
+            while (Transfers.Count > 50)
+                Transfers.RemoveAt(Transfers.Count - 1);
         });
     }
 

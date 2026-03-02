@@ -442,14 +442,12 @@ public sealed class SyncEngine : IDisposable
                     if (ok)
                     {
                         FileLogger.Log($"  上传成功: {relativePath}");
+                        // 上传成功后立即设置 debounce，防止队列中积压的 ModifyFile 引发链式重复上传
+                        _lastChangedTicks[relativePath] = DateTime.UtcNow.Ticks;
                         ConvertToPlaceholderAndSync(fullPath, relativePath);
                         transferItem.Progress = 100;
                         transferItem.Status = TransferStatus.Completed;
                         SyncStatusManager.Instance.AddLog("✅", $"已上传: {relativePath}");
-
-                        // 3 秒后移除传输条目
-                        _ = Task.Delay(3000).ContinueWith(_ =>
-                            SyncStatusManager.Instance.RemoveTransfer(transferItem));
                         return;
                     }
                     else if (attempt < 5)
@@ -473,8 +471,6 @@ public sealed class SyncEngine : IDisposable
             // 上传失败
             transferItem.Status = TransferStatus.Failed;
             SyncStatusManager.Instance.AddLog("❌", $"上传失败: {relativePath}");
-            _ = Task.Delay(5000).ContinueWith(_ =>
-                SyncStatusManager.Instance.RemoveTransfer(transferItem));
         }
         finally
         {

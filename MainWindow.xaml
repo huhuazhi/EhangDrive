@@ -55,14 +55,15 @@
                                                            Foreground="#333" TextTrimming="CharacterEllipsis"/>
                                                 <ProgressBar Value="{Binding Progress}" Maximum="100"
                                                              Style="{StaticResource TransferProgress}"
+                                                             Foreground="{Binding StatusColor}"
                                                              Margin="0,3,0,0"/>
                                             </StackPanel>
                                             <TextBlock Grid.Column="2" Text="{Binding ProgressText}"
                                                        FontSize="11" Foreground="#666"
                                                        VerticalAlignment="Center"
                                                        HorizontalAlignment="Right"/>
-                                            <TextBlock Grid.Column="3" Text="{Binding Speed}"
-                                                       FontSize="11" Foreground="#888"
+                                            <TextBlock Grid.Column="3" Text="{Binding StatusText}"
+                                                       FontSize="11" Foreground="{Binding StatusColor}"
                                                        VerticalAlignment="Center"
                                                        HorizontalAlignment="Right"/>
                                         </Grid>
