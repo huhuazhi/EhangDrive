@@ -200,7 +200,8 @@ public sealed class SyncEngine : IDisposable
             else if (File.Exists(evt.FullPath))
             {
                 // 文件 rename 失败（旧路径从未上传过），直接上传
-                await UploadFileWithRetry(evt.FullPath, evt.RelativePath);
+                // forceUpload=true: 即使是 placeholder 也强制上传（移动的 placeholder）
+                await UploadFileWithRetry(evt.FullPath, evt.RelativePath, forceUpload: true);
                 return; // UploadFileWithRetry 内部已调用 ConvertToPlaceholderAndSync
             }
         }
@@ -232,19 +233,15 @@ public sealed class SyncEngine : IDisposable
             return;
         }
 
-        // 跳过 placeholder 文件（ReparsePoint 属性表示已是 Cloud Filter placeholder）
+        bool isPlaceholder = false;
         try
         {
             var fi = new FileInfo(evt.FullPath);
-            if (fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
-            {
-                FileLogger.Log($"  跳过 placeholder 文件: {evt.RelativePath}");
-                return;
-            }
+            isPlaceholder = fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint);
         }
         catch { return; }
 
-        // ── move 检测：HandleDelete 已非阻塞地把旧路径放进 _pendingDeletes ──
+        // ── move 检测（必须在 placeholder 跳过之前！placeholder 文件也可能是 move 的产物）──
         var fileName = Path.GetFileName(evt.RelativePath);
         if (TryCancelPendingDelete(fileName, out var oldRelativePath))
         {
@@ -253,6 +250,13 @@ public sealed class SyncEngine : IDisposable
                 SyncEventType.RenameItem,
                 evt.FullPath, evt.RelativePath,
                 null, oldRelativePath));
+            return;
+        }
+
+        // 非 move 场景的 placeholder 文件 → 跳过
+        if (isPlaceholder)
+        {
+            FileLogger.Log($"  跳过 placeholder 文件(非移动): {evt.RelativePath}");
             return;
         }
 
@@ -366,7 +370,8 @@ public sealed class SyncEngine : IDisposable
     /// <summary>
     /// 等待文件可读后上传，最多重试 5 次
     /// </summary>
-    private async Task UploadFileWithRetry(string fullPath, string relativePath)
+    /// <param name="forceUpload">为 true 时跳过 placeholder 检查（rename fallback 场景）</param>
+    private async Task UploadFileWithRetry(string fullPath, string relativePath, bool forceUpload = false)
     {
         // 去重：已在上传中则跳过
         if (!_uploadingFiles.TryAdd(relativePath, true))
@@ -398,18 +403,21 @@ public sealed class SyncEngine : IDisposable
                     return;
                 }
 
-                // 跳过已变成 placeholder 的文件
-                try
+                // 跳过已变成 placeholder 的文件（forceUpload 时允许上传 placeholder）
+                if (!forceUpload)
                 {
-                    var fi = new FileInfo(fullPath);
-                    if (fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
+                    try
                     {
-                        FileLogger.Log($"  已是 placeholder，跳过: {relativePath}");
-                        SyncStatusManager.Instance.RemoveTransfer(transferItem);
-                        return;
+                        var fi = new FileInfo(fullPath);
+                        if (fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
+                        {
+                            FileLogger.Log($"  已是 placeholder，跳过: {relativePath}");
+                            SyncStatusManager.Instance.RemoveTransfer(transferItem);
+                            return;
+                        }
                     }
+                    catch { }
                 }
-                catch { }
 
                 try
                 {

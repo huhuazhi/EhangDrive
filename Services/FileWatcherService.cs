@@ -79,19 +79,8 @@ public sealed class FileWatcherService : IDisposable
         }
         else if (File.Exists(e.FullPath))
         {
-            // 跳过 placeholder 文件
-            try
-            {
-                var fi = new FileInfo(e.FullPath);
-                if (fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
-                {
-                    FileLogger.Log($"  → 跳过 placeholder 文件");
-                    return;
-                }
-            }
-            catch { return; }
-
             // 检查是否有同名 pending delete（文件 move = delete + create）
+            // 注意：必须在 placeholder 检查之前！移动的 placeholder 文件也需要处理
             var name = Path.GetFileName(e.FullPath);
             if (_engine.TryCancelPendingDelete(name, out var oldRelativePath))
             {
@@ -102,6 +91,29 @@ public sealed class FileWatcherService : IDisposable
                     relativePath,
                     null,
                     oldRelativePath));
+                return;
+            }
+
+            // 跳过 placeholder 文件（非移动场景）
+            // 但如果对应的 DeleteItem 还在消费者队列中（尚未处理），
+            // 上面的 TryCancelPendingDelete 找不到，需要入队让消费者侧再检测一次
+            bool isPlaceholder = false;
+            try
+            {
+                var fi = new FileInfo(e.FullPath);
+                isPlaceholder = fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint);
+            }
+            catch { return; }
+
+            if (isPlaceholder)
+            {
+                // Placeholder 文件出现在 Created 事件中，很可能是 move 的后半段
+                // 入队让消费者有机会在 HandleDelete 处理后再做 move 检测
+                FileLogger.Log($"  → Placeholder 文件 Created，入队待消费者判断: {relativePath}");
+                _engine.Enqueue(new SyncEvent(
+                    SyncEventType.CreateFile,
+                    e.FullPath,
+                    relativePath));
                 return;
             }
 
