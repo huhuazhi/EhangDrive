@@ -111,5 +111,21 @@ public class SyncStatusManager : INotifyPropertyChanged
         });
     }
 
+    public void AddTransfer(TransferItem item)
+    {
+        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        {
+            Transfers.Insert(0, item);
+        });
+    }
+
+    public void RemoveTransfer(TransferItem item)
+    {
+        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        {
+            Transfers.Remove(item);
+        });
+    }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 }

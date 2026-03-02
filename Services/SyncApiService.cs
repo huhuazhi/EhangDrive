@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -51,7 +52,7 @@ public class SyncApiService
     public SyncApiService(string server, string token)
     {
         _baseUrl = $"http://{server}/api/sync-config";
-        _http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        _http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) }; // 大文件上传需要更长超时
         _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
     }
 
@@ -123,6 +124,100 @@ public class SyncApiService
         }
         catch
         {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 上传本地文件到服务端（流式 PUT /upload-stream）
+    /// </summary>
+    public async Task<bool> UploadFileAsync(string relativePath, string localFullPath,
+        Action<long, long>? onProgress = null)
+    {
+        try
+        {
+            var mtime = new DateTimeOffset(File.GetLastWriteTimeUtc(localFullPath)).ToUnixTimeSeconds();
+            var fi = new FileInfo(localFullPath);
+            long totalSize = fi.Length;
+
+            using var fs = File.OpenRead(localFullPath);
+            HttpContent fileContent;
+            if (onProgress != null && totalSize > 0)
+                fileContent = new ProgressStreamContent(fs, totalSize, onProgress);
+            else
+                fileContent = new StreamContent(fs);
+            fileContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+
+            var url = $"{_baseUrl}/upload-stream?path={Uri.EscapeDataString(relativePath)}&mtime={mtime}&offset=0";
+            FileLogger.Log($"UploadFileAsync: PUT {url} (size={totalSize})");
+            var request = new HttpRequestMessage(HttpMethod.Put, url) { Content = fileContent };
+
+            var resp = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            var body = await resp.Content.ReadAsStringAsync();
+            FileLogger.Log($"  HTTP {(int)resp.StatusCode}: {body}");
+            return resp.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"  UploadFileAsync 异常: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 带进度报告的 HTTP 内容（用于上传大文件时显示进度）
+    /// </summary>
+    private class ProgressStreamContent : HttpContent
+    {
+        private readonly Stream _stream;
+        private readonly long _totalSize;
+        private readonly Action<long, long> _onProgress;
+
+        public ProgressStreamContent(Stream stream, long totalSize, Action<long, long> onProgress)
+        {
+            _stream = stream;
+            _totalSize = totalSize;
+            _onProgress = onProgress;
+        }
+
+        protected override async Task SerializeToStreamAsync(Stream stream, System.Net.TransportContext? context)
+        {
+            var buffer = new byte[81920];
+            long uploaded = 0;
+            int read;
+            while ((read = await _stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+            {
+                await stream.WriteAsync(buffer, 0, read);
+                uploaded += read;
+                _onProgress(uploaded, _totalSize);
+            }
+        }
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = _totalSize;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// 删除服务端文件或目录
+    /// </summary>
+    public async Task<bool> DeleteAsync(string relativePath)
+    {
+        try
+        {
+            var url = $"{_baseUrl}/delete";
+            var payload = JsonSerializer.Serialize(new { path = relativePath });
+            FileLogger.Log($"DeleteAsync: POST {url} (path={relativePath})");
+            var content = new StringContent(payload, Encoding.UTF8, "application/json");
+            var response = await _http.PostAsync(url, content);
+            FileLogger.Log($"  HTTP {(int)response.StatusCode}");
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"  DeleteAsync 异常: {ex.Message}");
             return false;
         }
     }
