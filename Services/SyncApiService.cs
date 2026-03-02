@@ -78,6 +78,31 @@ public class RegisterClientResponse
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  客户端列表 API 响应模型
+// ═══════════════════════════════════════════════════════════════
+
+public class ClientInfo
+{
+    [JsonPropertyName("client_id")]
+    public string ClientId { get; set; } = "";
+
+    [JsonPropertyName("hostname")]
+    public string Hostname { get; set; } = "";
+
+    [JsonPropertyName("ip")]
+    public string Ip { get; set; } = "";
+
+    [JsonPropertyName("registered_at")]
+    public string RegisteredAt { get; set; } = "";
+}
+
+public class ClientListResponse
+{
+    [JsonPropertyName("clients")]
+    public List<ClientInfo> Clients { get; set; } = new();
+}
+
+// ═══════════════════════════════════════════════════════════════
 
 /// <summary>
 /// 封装服务端同步 API 调用
@@ -119,6 +144,52 @@ public class SyncApiService
         {
             FileLogger.Log($"RegisterClient 异常: {ex.Message}");
             return 1;
+        }
+    }
+
+    /// <summary>
+    /// 获取已注册的客户端列表。
+    /// </summary>
+    public async Task<List<ClientInfo>> GetClientsAsync()
+    {
+        try
+        {
+            var url = $"{_baseUrl}/clients";
+            var response = await _http.GetAsync(url);
+            if (!response.IsSuccessStatusCode)
+            {
+                FileLogger.Log($"GetClients: HTTP {(int)response.StatusCode}");
+                return new List<ClientInfo>();
+            }
+            var json = await response.Content.ReadAsStringAsync();
+            var result = JsonSerializer.Deserialize<ClientListResponse>(json);
+            return result?.Clients ?? new List<ClientInfo>();
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"GetClients 异常: {ex.Message}");
+            return new List<ClientInfo>();
+        }
+    }
+
+    /// <summary>
+    /// 删除（注销）一个客户端。
+    /// </summary>
+    public async Task<bool> RemoveClientAsync(string clientId)
+    {
+        try
+        {
+            var url = $"{_baseUrl}/remove-client";
+            var payload = JsonSerializer.Serialize(new { client_id = clientId });
+            var content = new StringContent(payload, Encoding.UTF8, "application/json");
+            var response = await _http.PostAsync(url, content);
+            FileLogger.Log($"RemoveClient: HTTP {(int)response.StatusCode}, client_id={clientId}");
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"RemoveClient 异常: {ex.Message}");
+            return false;
         }
     }
 

@@ -184,6 +184,59 @@
                             </StackPanel>
                         </Border>
 
+                        <!-- 已注册客户端 -->
+                        <Border Background="White" CornerRadius="6" Padding="20,16"
+                                Margin="0,0,0,8">
+                            <Border.Effect>
+                                <DropShadowEffect BlurRadius="8" ShadowDepth="1" Opacity="0.08"/>
+                            </Border.Effect>
+                            <StackPanel>
+                                <DockPanel Margin="0,0,0,12">
+                                    <TextBlock Text="已注册客户端" FontSize="14" FontWeight="SemiBold"
+                                               Foreground="#333" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="TxtClientCount" FontSize="13" Foreground="#888"
+                                               Margin="8,0,0,0" VerticalAlignment="Center"/>
+                                    <Button x:Name="BtnRefreshClients" Content="刷新" Width="50" Height="26"
+                                            FontSize="12" Cursor="Hand" HorizontalAlignment="Right"
+                                            Background="#1A73E8" Foreground="White" BorderThickness="0"
+                                            Click="BtnRefreshClients_Click"/>
+                                </DockPanel>
+                                <ListView x:Name="LvClients" BorderThickness="1" BorderBrush="#E0E0E0"
+                                          Background="Transparent" MaxHeight="180"
+                                          ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                    <ListView.View>
+                                        <GridView>
+                                            <GridViewColumn Header="主机名" Width="140"
+                                                            DisplayMemberBinding="{Binding Hostname}"/>
+                                            <GridViewColumn Header="IP" Width="120"
+                                                            DisplayMemberBinding="{Binding Ip}"/>
+                                            <GridViewColumn Header="本机" Width="45">
+                                                <GridViewColumn.CellTemplate>
+                                                    <DataTemplate>
+                                                        <TextBlock Text="{Binding IsCurrentText}" FontSize="12"
+                                                                   Foreground="#1A73E8" FontWeight="Bold"/>
+                                                    </DataTemplate>
+                                                </GridViewColumn.CellTemplate>
+                                            </GridViewColumn>
+                                            <GridViewColumn Header="操作" Width="60">
+                                                <GridViewColumn.CellTemplate>
+                                                    <DataTemplate>
+                                                        <Button Content="删除" FontSize="11" Cursor="Hand"
+                                                                Width="44" Height="22"
+                                                                Background="#E74C3C" Foreground="White"
+                                                                BorderThickness="0"
+                                                                Visibility="{Binding DeleteVisibility}"
+                                                                Tag="{Binding ClientId}"
+                                                                Click="BtnDeleteClient_Click"/>
+                                                    </DataTemplate>
+                                                </GridViewColumn.CellTemplate>
+                                            </GridViewColumn>
+                                        </GridView>
+                                    </ListView.View>
+                                </ListView>
+                            </StackPanel>
+                        </Border>
+
                         <!-- 通用设置 -->
                         <Border Background="White" CornerRadius="6" Padding="20,16"
                                 Margin="0,0,0,8">

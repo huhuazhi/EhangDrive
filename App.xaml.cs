@@ -205,7 +205,8 @@ public partial class App : Application
         _mainWindow = new MainWindow(newConfig, _connection,
             onLogout: HandleLogout,
             onChangeSyncFolder: HandleChangeSyncFolder,
-            syncEngine: _syncEngine);
+            syncEngine: _syncEngine,
+            api: api);
 
         // ──── 创建托盘图标 ───────────────────────────────────────
         _trayIcon = new TrayIconService(
