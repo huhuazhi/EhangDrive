@@ -57,6 +57,7 @@ public sealed class SyncEngine : IDisposable
 
     // 需要在所有文件传完后统一刷新 IN_SYNC 的目录（避免并发竞争）
     private readonly ConcurrentDictionary<string, byte> _dirtyDirectories = new(StringComparer.OrdinalIgnoreCase);
+    public bool HasDirtyDirectories => !_dirtyDirectories.IsEmpty;
 
     /// <summary>
     /// 检查路径是否在最近被同步处理过（用于过滤反馈事件）
@@ -583,14 +584,16 @@ public sealed class SyncEngine : IDisposable
             else
                 FileLogger.Log($"  CfConvertToPlaceholder → 0x{hr:X8}");
 
-            // 设置同步状态
-            hr = CfSetInSyncState(
-                handle.DangerousGetHandle(),
-                CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
-                CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
-                IntPtr.Zero);
-
-            FileLogger.Log($"  CfSetInSyncState → 0x{hr:X8}");
+            // 目录的 IN_SYNC 由 FlushDirtyDirectories 统一设置，这里只给文件设
+            if (!isDir)
+            {
+                hr = CfSetInSyncState(
+                    handle.DangerousGetHandle(),
+                    CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                    CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                    IntPtr.Zero);
+                FileLogger.Log($"  CfSetInSyncState → 0x{hr:X8}");
+            }
 
             // 通知 Explorer 刷新文件图标覆盖（解决蓝圈不自动变绿勾的问题）
             SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, fullPath);

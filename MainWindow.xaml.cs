@@ -38,30 +38,17 @@ public partial class MainWindow : Window
         // 填充设置页
         LoadSettings();
 
-        // 每秒刷新剩余文件数
-        bool _wasBusy = false;
-        int _idleSeconds = 0;
+        // 每秒刷新剩余文件数 + 检查脏目录
         var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         timer.Tick += (_, _) =>
         {
             int count = _syncEngine?.PendingCount ?? 0;
             TxtPendingCount.Text = count > 0 ? $"(剩余 {count} 个)" : "";
 
-            // 检测从忙变闲：所有文件传完后 1 秒，统一刷新父目录 IN_SYNC
-            if (count > 0)
+            // 队列空闲且有脏目录时，统一刷新父目录 IN_SYNC
+            if (count == 0 && (_syncEngine?.HasDirtyDirectories ?? false))
             {
-                _wasBusy = true;
-                _idleSeconds = 0;
-            }
-            else if (_wasBusy)
-            {
-                _idleSeconds++;
-                if (_idleSeconds >= 1)
-                {
-                    _wasBusy = false;
-                    _idleSeconds = 0;
-                    Task.Run(() => _syncEngine?.FlushDirtyDirectories());
-                }
+                Task.Run(() => _syncEngine?.FlushDirtyDirectories());
             }
         };
         timer.Start();
