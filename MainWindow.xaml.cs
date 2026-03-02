@@ -39,11 +39,30 @@ public partial class MainWindow : Window
         LoadSettings();
 
         // 每秒刷新剩余文件数
+        bool _wasBusy = false;
+        int _idleSeconds = 0;
         var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         timer.Tick += (_, _) =>
         {
             int count = _syncEngine?.PendingCount ?? 0;
             TxtPendingCount.Text = count > 0 ? $"(剩余 {count} 个)" : "";
+
+            // 检测从忙变闲：所有文件传完后 1 秒，统一刷新父目录 IN_SYNC
+            if (count > 0)
+            {
+                _wasBusy = true;
+                _idleSeconds = 0;
+            }
+            else if (_wasBusy)
+            {
+                _idleSeconds++;
+                if (_idleSeconds >= 1)
+                {
+                    _wasBusy = false;
+                    _idleSeconds = 0;
+                    Task.Run(() => _syncEngine?.FlushDirtyDirectories());
+                }
+            }
         };
         timer.Start();
 

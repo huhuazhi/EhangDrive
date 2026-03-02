@@ -55,6 +55,9 @@ public sealed class SyncEngine : IDisposable
     // 并发上传控制：最多同时上传 15 个文件
     private readonly SemaphoreSlim _uploadSemaphore = new(15, 15);
 
+    // 需要在所有文件传完后统一刷新 IN_SYNC 的目录（避免并发竞争）
+    private readonly ConcurrentDictionary<string, byte> _dirtyDirectories = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>
     /// 检查路径是否在最近被同步处理过（用于过滤反馈事件）
     /// </summary>
@@ -593,12 +596,8 @@ public sealed class SyncEngine : IDisposable
             SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, fullPath);
 
             // 子文件/子目录转 placeholder 后，Windows 会清除父目录的 IN_SYNC 状态（变白云）
-            // 所以需要重新对父目录设 IN_SYNC
-            var parentDir = Path.GetDirectoryName(fullPath);
-            if (!string.IsNullOrEmpty(parentDir) && parentDir != _syncFolder)
-            {
-                SetParentDirectoriesInSync(parentDir);
-            }
+            // 记录需要刷新的父目录，等所有文件传完后统一批量刷新
+            MarkParentDirectoriesDirty(fullPath);
         }
         catch (Exception ex)
         {
@@ -607,31 +606,52 @@ public sealed class SyncEngine : IDisposable
     }
 
     /// <summary>
-    /// 对父目录（及更上层目录）重新设 IN_SYNC，解决子文件转 placeholder 后父目录变白云的问题
+    /// 记录需要刷新 IN_SYNC 的父目录（向上遍历到同步根目录）
     /// </summary>
-    private void SetParentDirectoriesInSync(string dirPath)
+    private void MarkParentDirectoriesDirty(string fullPath)
     {
-        // 向上遍历到同步根目录为止
-        while (!string.IsNullOrEmpty(dirPath) &&
-               dirPath.StartsWith(_syncFolder, StringComparison.OrdinalIgnoreCase) &&
-               dirPath.Length > _syncFolder.Length)
+        var dir = Path.GetDirectoryName(fullPath);
+        while (!string.IsNullOrEmpty(dir) &&
+               dir.StartsWith(_syncFolder, StringComparison.OrdinalIgnoreCase) &&
+               dir.Length > _syncFolder.Length)
+        {
+            _dirtyDirectories.TryAdd(dir, 0);
+            dir = Path.GetDirectoryName(dir);
+        }
+    }
+
+    /// <summary>
+    /// 批量刷新所有脏目录的 IN_SYNC 状态，从最深处开始向上设置
+    /// </summary>
+    public void FlushDirtyDirectories()
+    {
+        if (_dirtyDirectories.IsEmpty) return;
+
+        // 取出并清空
+        var dirs = _dirtyDirectories.Keys.ToList();
+        _dirtyDirectories.Clear();
+
+        // 按路径长度从长到短排序（最深的目录先处理）
+        dirs.Sort((a, b) => b.Length.CompareTo(a.Length));
+
+        FileLogger.Log($"FlushDirtyDirectories: 刷新 {dirs.Count} 个目录的 IN_SYNC 状态");
+
+        foreach (var dir in dirs)
         {
             try
             {
-                using var handle = OpenFileForCldApi(dirPath);
-                if (handle == null) break;
+                using var handle = OpenFileForCldApi(dir);
+                if (handle == null) continue;
 
-                int hr = CfSetInSyncState(
+                CfSetInSyncState(
                     handle.DangerousGetHandle(),
                     CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
                     CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
                     IntPtr.Zero);
 
-                SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, dirPath);
+                SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, dir);
             }
             catch { }
-
-            dirPath = Path.GetDirectoryName(dirPath)!;
         }
     }
 
