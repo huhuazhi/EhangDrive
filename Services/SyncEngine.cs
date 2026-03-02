@@ -49,6 +49,9 @@ public sealed class SyncEngine : IDisposable
     // key=relativePath, value=(fullPath, enqueueTicks)
     private readonly ConcurrentDictionary<string, (string fullPath, long ticks)> _pendingDeletes = new(StringComparer.OrdinalIgnoreCase);
 
+    // 队列中待处理的事件数（Channel.Reader.Count 在 SingleReader=true 时不可用，所以手动计数）
+    private int _pendingEventCount;
+
     // 并发上传控制：最多同时上传 5 个文件
     private readonly SemaphoreSlim _uploadSemaphore = new(5, 5);
 
@@ -79,11 +82,17 @@ public sealed class SyncEngine : IDisposable
     }
 
     /// <summary>
+    /// 队列中待处理 + 正在上传中的文件数
+    /// </summary>
+    public int PendingCount => _pendingEventCount + _uploadingFiles.Count;
+
+    /// <summary>
     /// 生产者入口：丢一个同步事件进来，立即返回
     /// </summary>
     public void Enqueue(SyncEvent evt)
     {
         _channel.Writer.TryWrite(evt);
+        Interlocked.Increment(ref _pendingEventCount);
     }
 
     /// <summary>
@@ -93,6 +102,7 @@ public sealed class SyncEngine : IDisposable
     {
         await foreach (var evt in _channel.Reader.ReadAllAsync(ct))
         {
+            Interlocked.Decrement(ref _pendingEventCount);
             try
             {
                 await ProcessEvent(evt);

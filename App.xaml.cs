@@ -144,7 +144,8 @@ public partial class App : Application
         // ──── 创建主窗口 ─────────────────────────────────────────
         _mainWindow = new MainWindow(newConfig, _connection,
             onLogout: HandleLogout,
-            onChangeSyncFolder: HandleChangeSyncFolder);
+            onChangeSyncFolder: HandleChangeSyncFolder,
+            syncEngine: _syncEngine);
 
         // ──── 创建托盘图标 ───────────────────────────────────────
         _trayIcon = new TrayIconService(

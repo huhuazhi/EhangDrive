@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Threading;
 using EhangNAS_Sync.Models;
 using EhangNAS_Sync.Services;
 using Microsoft.Win32;
@@ -16,16 +17,19 @@ public partial class MainWindow : Window
     private readonly SyncProviderConnection _connection;
     private readonly Action _onLogout;
     private readonly Action<string> _onChangeSyncFolder;
+    private readonly SyncEngine? _syncEngine;
     private bool _isExiting;
 
     public MainWindow(LoginConfig config, SyncProviderConnection connection,
-                      Action onLogout, Action<string> onChangeSyncFolder)
+                      Action onLogout, Action<string> onChangeSyncFolder,
+                      SyncEngine? syncEngine = null)
     {
         InitializeComponent();
         _config = config;
         _connection = connection;
         _onLogout = onLogout;
         _onChangeSyncFolder = onChangeSyncFolder;
+        _syncEngine = syncEngine;
 
         // 绑定传输列表和日志
         LvTransfers.ItemsSource = SyncStatusManager.Instance.Transfers;
@@ -33,6 +37,15 @@ public partial class MainWindow : Window
 
         // 填充设置页
         LoadSettings();
+
+        // 每秒刷新剩余文件数
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        timer.Tick += (_, _) =>
+        {
+            int count = _syncEngine?.PendingCount ?? 0;
+            TxtPendingCount.Text = count > 0 ? $"(剩余 {count} 个)" : "";
+        };
+        timer.Start();
 
         // 添加初始日志
         SyncStatusManager.Instance.AddLog("✅", "亿航Drive 已启动");

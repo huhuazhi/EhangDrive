@@ -33,8 +33,12 @@
                             <DropShadowEffect BlurRadius="8" ShadowDepth="1" Opacity="0.08"/>
                         </Border.Effect>
                         <DockPanel>
-                            <TextBlock DockPanel.Dock="Top" Text="传输任务" FontSize="13"
-                                       FontWeight="SemiBold" Foreground="#444" Margin="0,0,0,8"/>
+                            <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,8">
+                                <TextBlock Text="传输任务" FontSize="13"
+                                           FontWeight="SemiBold" Foreground="#444"/>
+                                <TextBlock x:Name="TxtPendingCount" FontSize="13"
+                                           Foreground="#888" Margin="8,0,0,0"/>
+                            </StackPanel>
                             <ListView x:Name="LvTransfers" BorderThickness="0"
                                       Background="Transparent"
                                       ScrollViewer.HorizontalScrollBarVisibility="Disabled">
