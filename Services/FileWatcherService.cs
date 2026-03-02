@@ -22,7 +22,8 @@ public sealed class FileWatcherService : IDisposable
             NotifyFilter = NotifyFilters.DirectoryName
                          | NotifyFilters.FileName
                          | NotifyFilters.LastWrite
-                         | NotifyFilters.Size,
+                         | NotifyFilters.Size
+                         | NotifyFilters.Attributes,
             InternalBufferSize = 64 * 1024, // 64KB 缓冲区，防止事件丢失
         };
 
@@ -133,6 +134,10 @@ public sealed class FileWatcherService : IDisposable
             // FileLogger.Log($"FileWatcher.Changed 跳过(反馋): {e.FullPath}");
             return;
         }
+
+        // 优先检查是否是"释放空间"触发的属性变化（PinState → UNPINNED）
+        if (SyncProviderConnection.TryHandleDehydrateRequest(e.FullPath))
+            return;
 
         // 只处理文件修改（目录的 Changed 忽略）
         if (!File.Exists(e.FullPath) || Directory.Exists(e.FullPath)) return;

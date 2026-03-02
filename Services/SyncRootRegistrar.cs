@@ -23,12 +23,17 @@ public static class SyncRootRegistrar
         // 生成唯一的同步根 ID
         var syncRootId = BuildSyncRootId(username);
 
-        // 如果已注册，跳过重新注册以保留文件的 in-sync 状态（绿勾不变蓝圈）
-        // StorageProviderSyncRootManager.Register 支持更新已有注册，无需先 Unregister
+        // 如果已注册且路径一致，仍执行 Register（覆盖更新策略，不会影响现有 placeholder）
+        // 路径不同则需要先注销再重新注册（用户换了同步文件夹）
         if (IsRegistered(syncRootId))
         {
-            FileLogger.Log($"同步根已注册，跳过: {syncRootId}");
-            return;
+            var existingPath = GetRegisteredPath(syncRootId);
+            if (!string.Equals(existingPath, syncFolderPath, StringComparison.OrdinalIgnoreCase))
+            {
+                FileLogger.Log($"同步根路径已变更: {existingPath} → {syncFolderPath}，重新注册");
+                try { StorageProviderSyncRootManager.Unregister(syncRootId); }
+                catch { }
+            }
         }
 
         var info = new StorageProviderSyncRootInfo
@@ -43,7 +48,8 @@ public static class SyncRootRegistrar
                                     | StorageProviderHydrationPolicyModifier.AutoDehydrationAllowed,
             PopulationPolicy = StorageProviderPopulationPolicy.Full,
             InSyncPolicy = StorageProviderInSyncPolicy.FileCreationTime
-                         | StorageProviderInSyncPolicy.DirectoryCreationTime,
+                         | StorageProviderInSyncPolicy.DirectoryCreationTime
+                         | (StorageProviderInSyncPolicy)0x80000000, // PreserveInSyncForSyncEngine
             HardlinkPolicy = StorageProviderHardlinkPolicy.None,
             Context = CryptographicBuffer.ConvertStringToBinary(
                 syncRootId, BinaryStringEncoding.Utf8),
@@ -88,6 +94,24 @@ public static class SyncRootRegistrar
             // 忽略错误
         }
         return false;
+    }
+
+    /// <summary>
+    /// 获取已注册同步根的路径
+    /// </summary>
+    private static string? GetRegisteredPath(string syncRootId)
+    {
+        try
+        {
+            var roots = StorageProviderSyncRootManager.GetCurrentSyncRoots();
+            foreach (var root in roots)
+            {
+                if (string.Equals(root.Id, syncRootId, StringComparison.OrdinalIgnoreCase))
+                    return root.Path?.Path;
+            }
+        }
+        catch { }
+        return null;
     }
 
     private static string BuildSyncRootId(string username)

@@ -704,11 +704,20 @@ public sealed class SyncEngine : IDisposable
 
     /// <summary>
     /// 以适合 Cloud Filter API 的方式打开文件句柄
+    /// 对只读文件会临时去掉只读属性以获取写权限
     /// </summary>
     private static SafeFileHandle? OpenFileForCldApi(string path)
     {
         try
         {
+            bool removedReadOnly = false;
+            var attrs = File.GetAttributes(path);
+            if (attrs.HasFlag(System.IO.FileAttributes.ReadOnly))
+            {
+                File.SetAttributes(path, attrs & ~System.IO.FileAttributes.ReadOnly);
+                removedReadOnly = true;
+            }
+
             // FILE_FLAG_BACKUP_SEMANTICS (0x02000000) 用于打开目录
             var handle = CreateFileW(
                 path,
@@ -720,7 +729,13 @@ public sealed class SyncEngine : IDisposable
                 IntPtr.Zero);
 
             if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+            {
+                if (removedReadOnly) File.SetAttributes(path, attrs);
                 return null;
+            }
+
+            // 句柄打开成功后恢复只读属性
+            if (removedReadOnly) File.SetAttributes(path, attrs);
 
             return new SafeFileHandle(handle, ownsHandle: true);
         }
@@ -750,48 +765,6 @@ public sealed class SyncEngine : IDisposable
         uint dwCreationDisposition,
         uint dwFlagsAndAttributes,
         IntPtr hTemplateFile);
-
-    /// <summary>
-    /// 启动时扫描同步目录下所有文件/文件夹，将已有的 placeholder 重新标记为 IN_SYNC。
-    /// 解决 APP 重启后绿勾变蓝圈的问题。
-    /// </summary>
-    public void RestoreInSyncState()
-    {
-        FileLogger.Log("RestoreInSyncState: 开始扫描...");
-        int count = 0;
-        try
-        {
-            foreach (var entry in new DirectoryInfo(_syncFolder).EnumerateFileSystemInfos("*", SearchOption.AllDirectories))
-            {
-                try
-                {
-                    // 只处理 placeholder 文件（带 ReparsePoint 属性）
-                    if (!entry.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
-                        continue;
-
-                    using var handle = OpenFileForCldApi(entry.FullName);
-                    if (handle == null) continue;
-
-                    int hr = CfSetInSyncState(
-                        handle.DangerousGetHandle(),
-                        CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
-                        CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
-                        IntPtr.Zero);
-
-                    if (hr >= 0) count++;
-                }
-                catch { /* 跳过无法访问的文件 */ }
-            }
-        }
-        catch (Exception ex)
-        {
-            FileLogger.Log($"RestoreInSyncState 异常: {ex.Message}");
-        }
-        FileLogger.Log($"RestoreInSyncState: 完成，已恢复 {count} 个文件的同步状态");
-
-        // 通知 Explorer 刷新整个同步目录
-        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, _syncFolder);
-    }
 
     public void Dispose()
     {

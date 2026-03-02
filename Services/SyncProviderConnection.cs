@@ -22,6 +22,7 @@ public sealed class SyncProviderConnection : IDisposable
     // 必须持有委托引用，防止 GC 回收导致回调崩溃
     private CF_CALLBACK? _fetchPlaceholdersCallback;
     private CF_CALLBACK? _fetchDataCallback;
+    private CF_CALLBACK? _notifyDehydrateCallback;
 
     /// <summary>
     /// 连接到已注册的同步根目录
@@ -36,6 +37,7 @@ public sealed class SyncProviderConnection : IDisposable
         // 创建回调委托并持有引用
         _fetchPlaceholdersCallback = OnFetchPlaceholders;
         _fetchDataCallback = OnFetchData;
+        _notifyDehydrateCallback = OnNotifyDehydrate;
 
         var callbackTable = new CF_CALLBACK_REGISTRATION[]
         {
@@ -48,6 +50,11 @@ public sealed class SyncProviderConnection : IDisposable
             {
                 Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_FETCH_DATA,
                 Callback = Marshal.GetFunctionPointerForDelegate(_fetchDataCallback)
+            },
+            new()
+            {
+                Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE,
+                Callback = Marshal.GetFunctionPointerForDelegate(_notifyDehydrateCallback)
             },
             CF_CALLBACK_REGISTRATION.CF_CALLBACK_REGISTRATION_END
         };
@@ -177,6 +184,13 @@ public sealed class SyncProviderConnection : IDisposable
                 FileLogger.Log($"  CfExecute 调用: StructSize={opInfo.StructSize}, ParamSize={opParams.ParamSize}, count={items.Count}");
                 int hr = CfExecute(in opInfo, ref opParams);
                 FileLogger.Log($"  CfExecute(TRANSFER_PLACEHOLDERS) → 0x{hr:X8}, processed={opParams.EntriesProcessed}");
+
+                // ── 创建子占位符会清除父目录的 IN_SYNC 状态（白云），需要重新设回 ──
+                if (hr >= 0 && items.Count > 0 && !string.IsNullOrEmpty(relativePath))
+                {
+                    var dirFullPath = Path.Combine(_syncFolder!, relativePath.Replace('/', '\\'));
+                    SetItemInSync(dirFullPath);
+                }
             }
             finally
             {
@@ -187,6 +201,153 @@ public sealed class SyncProviderConnection : IDisposable
         catch (Exception ex)
         {
             FileLogger.Log($"  FETCH_PLACEHOLDERS 异常: {ex.Message}\n{ex.StackTrace}");
+        }
+    }
+
+    /// <summary>
+    /// 将文件/目录标记为 IN_SYNC（绿勾）
+    /// </summary>
+    private static void SetItemInSync(string path)
+    {
+        try
+        {
+            // 如果是目录，需要 FILE_FLAG_BACKUP_SEMANTICS
+            bool isDir = Directory.Exists(path);
+            uint flags = isDir ? 0x02000000u : 0x00000080u; // FILE_FLAG_BACKUP_SEMANTICS or FILE_ATTRIBUTE_NORMAL
+
+            IntPtr handle = CreateFileW(
+                path,
+                0x00000182, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA
+                0x00000007, // FILE_SHARE_READ | WRITE | DELETE
+                IntPtr.Zero,
+                3,          // OPEN_EXISTING
+                flags,
+                IntPtr.Zero);
+
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return;
+
+            try
+            {
+                CfSetInSyncState(
+                    handle,
+                    CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                    CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                    IntPtr.Zero);
+            }
+            finally
+            {
+                CloseHandle(handle);
+            }
+        }
+        catch { }
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFileW(
+        string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+        IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    /// <summary>
+    /// 检测并处理"释放空间"请求。
+    /// 用户右键"释放空间"后，Windows 将 PinState 设为 UNPINNED。
+    /// 检测到后主动调用 CfDehydratePlaceholder 释放本地数据。
+    /// </summary>
+    public static bool TryHandleDehydrateRequest(string fullPath)
+    {
+        try
+        {
+            bool isDir = Directory.Exists(fullPath);
+            bool isFile = !isDir && File.Exists(fullPath);
+            if (!isDir && !isFile) return false;
+
+            IntPtr handle = CreateFileW(
+                fullPath,
+                0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+                0x00000007, // FILE_SHARE_READ | WRITE | DELETE
+                IntPtr.Zero,
+                3,          // OPEN_EXISTING
+                0x02000000, // FILE_FLAG_BACKUP_SEMANTICS
+                IntPtr.Zero);
+
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
+
+            try
+            {
+                IntPtr buf = Marshal.AllocHGlobal(256);
+                try
+                {
+                    // InfoClass = 0 → CF_PLACEHOLDER_INFO_STANDARD
+                    // 第一个 DWORD = PinState; UNPINNED = 2
+                    int hr = CfGetPlaceholderInfo(handle, 0, buf, 256, out uint retLen);
+                    if (hr < 0 || retLen < 8) return false;
+
+                    uint pinState = (uint)Marshal.ReadInt32(buf, 0);
+                    if (pinState != 2) return false; // 不是 UNPINNED
+                }
+                finally { Marshal.FreeHGlobal(buf); }
+
+                if (isDir)
+                {
+                    // 目录：递归释放所有已 hydrated 文件
+                    FileLogger.Log($"DEHYDRATE: UNPINNED 目录检测到，释放空间: {fullPath}");
+                    int count = 0;
+                    foreach (var file in Directory.GetFiles(fullPath, "*", SearchOption.AllDirectories))
+                    {
+                        try
+                        {
+                            var fi = new FileInfo(file);
+                            if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
+                            if (fi.Attributes.HasFlag(FileAttributes.Offline)) continue; // 已 dehydrated
+
+                            var fh = CreateFileW(file,
+                                0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+                                0x00000007,
+                                IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+                            if (fh == IntPtr.Zero || fh == new IntPtr(-1)) continue;
+                            try
+                            {
+                                int dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
+                                if (dhr >= 0) count++;
+                                else FileLogger.Log($"  Dehydrate 失败: 0x{(uint)dhr:X8} {Path.GetFileName(file)}");
+                            }
+                            finally { CloseHandle(fh); }
+                        }
+                        catch { }
+                    }
+                    FileLogger.Log($"  已释放空间: {fullPath} ({count}个文件)");
+                    return true;
+                }
+                else
+                {
+                    // 单个文件
+                    var fi = new FileInfo(fullPath);
+                    if (fi.Attributes.HasFlag(FileAttributes.Offline)) return true; // 已 dehydrated
+                    if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) return false; // 不是 placeholder
+
+                    FileLogger.Log($"DEHYDRATE: UNPINNED 文件检测到，释放空间: {fullPath}");
+                    int dhr = CfDehydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
+                    if (dhr >= 0)
+                    {
+                        FileLogger.Log($"  已释放空间: {fullPath}");
+                        return true;
+                    }
+                    else
+                    {
+                        FileLogger.Log($"  Dehydrate 失败: 0x{(uint)dhr:X8} {fullPath}");
+                        return false;
+                    }
+                }
+            }
+            finally { CloseHandle(handle); }
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"TryHandleDehydrateRequest 异常: {ex.Message}");
+            return false;
         }
     }
 
@@ -306,6 +467,71 @@ public sealed class SyncProviderConnection : IDisposable
         catch (Exception ex)
         {
             FileLogger.Log($"  FETCH_DATA 异常: {ex.Message}\n{ex.StackTrace}");
+        }
+    }
+
+    /// <summary>
+    /// NOTIFY_DEHYDRATE 回调 — 用户右键"释放空间"时触发。
+    /// ACK 同意后 Windows 会删除本地数据，文件变为白云占位符。
+    /// </summary>
+    private static void OnNotifyDehydrate(IntPtr callbackInfoPtr, IntPtr callbackParamsPtr)
+    {
+        try
+        {
+            long connectionKey = CallbackInfoReader.GetConnectionKey(callbackInfoPtr);
+            long transferKey = CallbackInfoReader.GetTransferKey(callbackInfoPtr);
+            long requestKey = CallbackInfoReader.GetRequestKey(callbackInfoPtr);
+            IntPtr correlationVector = CallbackInfoReader.GetCorrelationVector(callbackInfoPtr);
+            string normalizedPath = CallbackInfoReader.GetNormalizedPathString(callbackInfoPtr);
+            string relativePath = GetRelativePath(normalizedPath);
+
+            FileLogger.Log($"NOTIFY_DEHYDRATE: {relativePath}");
+
+            // ACK 同意 dehydrate
+            var opInfo = new CF_OPERATION_INFO
+            {
+                StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
+                Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_ACK_DEHYDRATE,
+                ConnectionKey = connectionKey,
+                TransferKey = transferKey,
+                CorrelationVector = correlationVector,
+                SyncStatus = IntPtr.Zero,
+                RequestKey = requestKey,
+            };
+
+            var opParams = new CF_OPERATION_PARAMETERS_ACKDEHYDRATE
+            {
+                ParamSize = (uint)Marshal.SizeOf<CF_OPERATION_PARAMETERS_ACKDEHYDRATE>(),
+                Flags = 0,
+                CompletionStatus = 0, // STATUS_SUCCESS
+                FileIdentity = IntPtr.Zero,
+                FileIdentityLength = 0,
+            };
+
+            int hr = CfExecute(in opInfo, ref opParams);
+            FileLogger.Log($"  ACK_DEHYDRATE → 0x{hr:X8}");
+
+            if (hr >= 0)
+            {
+                // ACK 成功后，延迟恢复 IN_SYNC 状态
+                // Windows 执行 dehydrate 需要一点时间，之后会发 DEHYDRATE_COMPLETION
+                // 这里做延迟恢复作为双保险
+                string fullPath = normalizedPath.StartsWith(@"\\?\") ? normalizedPath.Substring(4) : normalizedPath;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(300);
+                        SetItemInSync(fullPath);
+                        FileLogger.Log($"  dehydrate后恢复IN_SYNC: {relativePath}");
+                    }
+                    catch { }
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"  NOTIFY_DEHYDRATE 异常: {ex.Message}");
         }
     }
 

@@ -64,6 +64,22 @@ internal static class CldApi
         CF_CREATE_FLAGS CreateFlags,
         out uint EntriesProcessed);
 
+    [DllImport("cldapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    public static extern int CfDehydratePlaceholder(
+        IntPtr FileHandle,
+        long StartingOffset,
+        long Length,
+        uint DehydrateFlags,
+        IntPtr Overlapped);
+
+    [DllImport("cldapi.dll", ExactSpelling = true)]
+    public static extern int CfGetPlaceholderInfo(
+        IntPtr FileHandle,
+        uint InfoClass,
+        IntPtr InfoBuffer,
+        uint InfoBufferLength,
+        out uint ReturnedLength);
+
     // ═══════════════════════════════════════════════════════════════
     //  枚举
     // ═══════════════════════════════════════════════════════════════
@@ -351,6 +367,27 @@ internal static class CldApi
         public long Offset;                 // LARGE_INTEGER
         public long Length;                 // LARGE_INTEGER
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  CF_OPERATION_PARAMETERS — AckDehydrate 变体 (x64)
+    // ═══════════════════════════════════════════════════════════════
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CF_OPERATION_PARAMETERS_ACKDEHYDRATE
+    {
+        public uint ParamSize;
+        public uint _padding;
+        // union AckDehydrate:
+        public uint Flags;                  // CF_OPERATION_ACK_DEHYDRATE_FLAGS
+        public int CompletionStatus;        // NTSTATUS
+        public IntPtr FileIdentity;         // LPCVOID
+        public uint FileIdentityLength;
+    }
+
+    [DllImport("cldapi.dll", ExactSpelling = true)]
+    public static extern int CfExecute(
+        in CF_OPERATION_INFO OpInfo,
+        ref CF_OPERATION_PARAMETERS_ACKDEHYDRATE OpParams);
 
     // ═══════════════════════════════════════════════════════════════
     //  CF_CALLBACK_REGISTRATION
