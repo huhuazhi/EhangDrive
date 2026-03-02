@@ -106,7 +106,9 @@ public sealed class SyncEngine : IDisposable
     {
         await foreach (var evt in _channel.Reader.ReadAllAsync(ct))
         {
-            Interlocked.Decrement(ref _pendingEventCount);
+            // 注意：不在此处 Decrement！
+            // Task.Run 派发的事件（CreateFile/ModifyFile/CreateDirectory）在各自 finally 中减计数，
+            // 避免事件还在 Task.Delay 等待中时 PendingCount 就已为 0 的计数盲区。
             try
             {
                 await ProcessEvent(evt);
@@ -131,9 +133,11 @@ public sealed class SyncEngine : IDisposable
                 {
                     try { await HandleCreateDirectory(evt); }
                     catch (Exception ex) { SyncStatusManager.Instance.AddLog("❌", $"处理异常: {ex.Message}"); }
+                    finally { Interlocked.Decrement(ref _pendingEventCount); }
                 });
                 break;
             case SyncEventType.RenameItem:
+                Interlocked.Decrement(ref _pendingEventCount);
                 await HandleRename(evt);
                 break;
             case SyncEventType.CreateFile:
@@ -142,6 +146,7 @@ public sealed class SyncEngine : IDisposable
                 {
                     try { await HandleCreateFile(evt); }
                     catch (Exception ex) { SyncStatusManager.Instance.AddLog("❌", $"处理异常: {ex.Message}"); }
+                    finally { Interlocked.Decrement(ref _pendingEventCount); }
                 });
                 break;
             case SyncEventType.ModifyFile:
@@ -150,9 +155,11 @@ public sealed class SyncEngine : IDisposable
                 {
                     try { await HandleModifyFile(evt); }
                     catch (Exception ex) { SyncStatusManager.Instance.AddLog("❌", $"处理异常: {ex.Message}"); }
+                    finally { Interlocked.Decrement(ref _pendingEventCount); }
                 });
                 break;
             case SyncEventType.DeleteItem:
+                Interlocked.Decrement(ref _pendingEventCount);
                 await HandleDelete(evt);
                 break;
         }
@@ -517,10 +524,7 @@ public sealed class SyncEngine : IDisposable
             _uploadingFiles.TryRemove(relativePath, out _);
 
             // 所有上传完成后，直接刷新脏目录（比依赖 Timer 更可靠）
-            var pc = PendingCount;
-            var hd = HasDirtyDirectories;
-            FileLogger.Log($"  UploadFinally: PendingCount={pc}, HasDirtyDirectories={hd}");
-            if (pc == 0 && hd)
+            if (PendingCount == 0 && HasDirtyDirectories)
             {
                 FlushDirtyDirectories();
             }
