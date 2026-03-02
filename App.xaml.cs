@@ -1,4 +1,5 @@
 ﻿using System.IO;
+using System.Threading;
 using System.Windows;
 using EhangNAS_Sync.Models;
 using EhangNAS_Sync.Services;
@@ -9,6 +10,8 @@ namespace EhangNAS_Sync;
 
 public partial class App : Application
 {
+    private static Mutex? _singleInstanceMutex;
+
     private SyncProviderConnection? _connection;
     private TrayIconService? _trayIcon;
     private SyncEngine? _syncEngine;
@@ -19,6 +22,15 @@ public partial class App : Application
 
     private async void Application_Startup(object sender, StartupEventArgs e)
     {
+        // ──── 单实例检查 ─────────────────────────────────────────
+        _singleInstanceMutex = new Mutex(true, "Global\\EhangDrive_SingleInstance", out bool createdNew);
+        if (!createdNew)
+        {
+            MessageBox.Show("亿航Drive 已在运行中。", "亿航Drive", MessageBoxButton.OK, MessageBoxImage.Information);
+            Shutdown();
+            return;
+        }
+
         // 防止关闭最后一个窗口时退出应用（托盘模式）
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
         FileLogger.Log("========== 应用启动 ==========");
@@ -245,6 +257,13 @@ public partial class App : Application
         _connection = null;
         _trayIcon?.Dispose();
         _trayIcon = null;
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        _singleInstanceMutex?.ReleaseMutex();
+        _singleInstanceMutex?.Dispose();
+        base.OnExit(e);
     }
 
     private static string? PickSyncFolder()
