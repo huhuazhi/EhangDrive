@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Threading;
 using EhangNAS_Sync.Models;
 using EhangNAS_Sync.Services;
 using Microsoft.Win32;
@@ -37,6 +38,15 @@ public partial class MainWindow : Window
         // 添加初始日志
         SyncStatusManager.Instance.AddLog("✅", "亿航Drive 已启动");
         SyncStatusManager.Instance.AddLog("📂", $"同步目录: {_config.SyncFolder}");
+
+        // 每秒刷新剩余文件数
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        timer.Tick += (_, _) =>
+        {
+            var n = SyncEngine.Current?.PendingCount ?? 0;
+            TxtPending.Text = n > 0 ? $"（剩余 {n} 个文件）" : "";
+        };
+        timer.Start();
     }
 
     private void LoadSettings()

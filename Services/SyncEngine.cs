@@ -30,6 +30,12 @@ public enum SyncEventType
 /// </summary>
 public sealed class SyncEngine : IDisposable
 {
+    /// <summary>当前活跃的引擎实例（用于 UI 读取待处理数）</summary>
+    public static SyncEngine? Current { get; private set; }
+
+    /// <summary>待处理文件数 = 队列中未消费 + 正在上传中</summary>
+    public int PendingCount => _channel.Reader.Count + _uploadingFiles.Count;
+
     private readonly SyncApiService _api;
     private readonly string _syncFolder;
     private readonly Channel<SyncEvent> _channel;
@@ -66,6 +72,7 @@ public sealed class SyncEngine : IDisposable
     {
         _api = api;
         _syncFolder = syncFolder;
+        Current = this;
 
         // 无界队列，生产者永远不阻塞
         _channel = Channel.CreateUnbounded<SyncEvent>(new UnboundedChannelOptions
@@ -79,20 +86,11 @@ public sealed class SyncEngine : IDisposable
     }
 
     /// <summary>
-    /// 待处理文件数 = 队列中尚未消费 + 正在上传中
-    /// </summary>
-    public int PendingCount => _channel.Reader.Count + _uploadingFiles.Count;
-
-    private void UpdatePendingCount()
-        => SyncStatusManager.Instance.PendingFileCount = PendingCount;
-
-    /// <summary>
     /// 生产者入口：丢一个同步事件进来，立即返回
     /// </summary>
     public void Enqueue(SyncEvent evt)
     {
         _channel.Writer.TryWrite(evt);
-        UpdatePendingCount();
     }
 
     /// <summary>
@@ -109,10 +107,6 @@ public sealed class SyncEngine : IDisposable
             catch (Exception ex)
             {
                 SyncStatusManager.Instance.AddLog("❌", $"处理异常: {ex.Message}");
-            }
-            finally
-            {
-                UpdatePendingCount();
             }
         }
     }
@@ -506,7 +500,6 @@ public sealed class SyncEngine : IDisposable
         {
             _uploadSemaphore.Release();
             _uploadingFiles.TryRemove(relativePath, out _);
-            UpdatePendingCount();
         }
     }
 

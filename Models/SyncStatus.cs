@@ -108,24 +108,6 @@ public class SyncStatusManager : INotifyPropertyChanged
     public ObservableCollection<TransferItem> Transfers { get; } = new();
     public ObservableCollection<SyncLogEntry> Logs { get; } = new();
 
-    private int _pendingFileCount;
-    public int PendingFileCount
-    {
-        get => _pendingFileCount;
-        set
-        {
-            if (_pendingFileCount == value) return;
-            _pendingFileCount = value;
-            System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
-            {
-                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(PendingFileCount)));
-                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(PendingText)));
-            });
-        }
-    }
-
-    public string PendingText => _pendingFileCount > 0 ? $"（剩余 {_pendingFileCount} 个文件）" : "";
-
     public void AddLog(string icon, string message)
     {
         System.Windows.Application.Current?.Dispatcher.Invoke(() =>
