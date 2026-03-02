@@ -116,8 +116,11 @@ public class SyncStatusManager : INotifyPropertyChanged
         {
             if (_pendingFileCount == value) return;
             _pendingFileCount = value;
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(PendingFileCount)));
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(PendingText)));
+            System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
+            {
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(PendingFileCount)));
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(PendingText)));
+            });
         }
     }
 
