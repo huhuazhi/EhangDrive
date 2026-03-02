@@ -30,12 +30,6 @@ public enum SyncEventType
 /// </summary>
 public sealed class SyncEngine : IDisposable
 {
-    /// <summary>当前活跃的引擎实例（用于 UI 读取待处理数）</summary>
-    public static SyncEngine? Current { get; private set; }
-
-    /// <summary>待处理文件数 = 队列中未消费 + 正在上传中</summary>
-    public int PendingCount => _channel.Reader.Count + _uploadingFiles.Count;
-
     private readonly SyncApiService _api;
     private readonly string _syncFolder;
     private readonly Channel<SyncEvent> _channel;
@@ -72,7 +66,6 @@ public sealed class SyncEngine : IDisposable
     {
         _api = api;
         _syncFolder = syncFolder;
-        Current = this;
 
         // 无界队列，生产者永远不阻塞
         _channel = Channel.CreateUnbounded<SyncEvent>(new UnboundedChannelOptions
@@ -584,14 +577,46 @@ public sealed class SyncEngine : IDisposable
             // 通知 Explorer 刷新文件图标覆盖（解决蓝圈不自动变绿勾的问题）
             SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, fullPath);
 
-            // 同时通知父目录刷新聚合同步状态
+            // 子文件/子目录转 placeholder 后，Windows 会清除父目录的 IN_SYNC 状态（变白云）
+            // 所以需要重新对父目录设 IN_SYNC
             var parentDir = Path.GetDirectoryName(fullPath);
-            if (!string.IsNullOrEmpty(parentDir))
-                SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, parentDir);
+            if (!string.IsNullOrEmpty(parentDir) && parentDir != _syncFolder)
+            {
+                SetParentDirectoriesInSync(parentDir);
+            }
         }
         catch (Exception ex)
         {
             FileLogger.Log($"  ConvertToPlaceholderAndSync 异常: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 对父目录（及更上层目录）重新设 IN_SYNC，解决子文件转 placeholder 后父目录变白云的问题
+    /// </summary>
+    private void SetParentDirectoriesInSync(string dirPath)
+    {
+        // 向上遍历到同步根目录为止
+        while (!string.IsNullOrEmpty(dirPath) &&
+               dirPath.StartsWith(_syncFolder, StringComparison.OrdinalIgnoreCase) &&
+               dirPath.Length > _syncFolder.Length)
+        {
+            try
+            {
+                using var handle = OpenFileForCldApi(dirPath);
+                if (handle == null) break;
+
+                int hr = CfSetInSyncState(
+                    handle.DangerousGetHandle(),
+                    CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                    CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                    IntPtr.Zero);
+
+                SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, dirPath);
+            }
+            catch { }
+
+            dirPath = Path.GetDirectoryName(dirPath)!;
         }
     }
 
