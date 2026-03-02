@@ -127,47 +127,116 @@ public sealed class ModListPollingService : IDisposable
 
     /// <summary>
     /// 处理远程文件更新：
-    ///   - 本地不存在 → 忽略（下次浏览目录时 FETCH_PLACEHOLDERS 自动处理）
+    ///   - 本地不存在 → 创建占位符（placeholder）
     ///   - 本地是白云(dehydrated) → 忽略（打开时 FETCH_DATA 自动拉最新）
-    ///   - 本地已 hydrated → 比较 mtime，云端新则脱水，本地新则上传
+    ///   - 本地已 hydrated：
+    ///       mtime 相同 → 自己上传的，跳过
+    ///       mtime 不同 → 别人修改的，脱水让用户下次打开获取新版
     /// </summary>
-    private async Task HandleRemoteUpdate(ModItem item, string localPath)
+    private Task HandleRemoteUpdate(ModItem item, string localPath)
     {
-        if (!File.Exists(localPath)) return;
+        if (!File.Exists(localPath))
+        {
+            // 本地不存在 → 创建占位符
+            CreatePlaceholderForFile(item, localPath);
+            return Task.CompletedTask;
+        }
 
         var fi = new FileInfo(localPath);
 
         // 不是 placeholder → 不管（普通文件由 FileWatcher 处理）
-        if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) return;
+        if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) return Task.CompletedTask;
 
         // 已脱水(Offline) → 不管，下次打开自然拉最新
-        if (fi.Attributes.HasFlag(FileAttributes.Offline)) return;
+        if (fi.Attributes.HasFlag(FileAttributes.Offline)) return Task.CompletedTask;
 
         // 文件是 hydrated 的 placeholder（绿勾），需要检查 mtime
         long localMtime = new DateTimeOffset(File.GetLastWriteTimeUtc(localPath)).ToUnixTimeSeconds();
         long cloudMtime = item.Mtime;
 
-        if (cloudMtime > localMtime)
+        if (localMtime == cloudMtime)
         {
-            // 云端更新 → 更新元数据并脱水本地文件
-            FileLogger.Log($"ModList: 云端更新，脱水本地: {item.Path} (cloud={cloudMtime}, local={localMtime})");
-            UpdateAndDehydrateFile(localPath, item.Mtime, item.Size);
-            SyncStatusManager.Instance.AddLog("☁️", $"云端已更新: {item.Path}");
+            // mtime 相同 → 自己上传的，跳过
+            return Task.CompletedTask;
         }
-        else if (localMtime > cloudMtime)
-        {
-            // 本地更新 → 上传到云端
-            // 先检查是否正在被 SyncEngine 处理
-            if (_syncEngine.IsRecentlySynced(localPath)) return;
 
-            FileLogger.Log($"ModList: 本地更新，上传: {item.Path} (cloud={cloudMtime}, local={localMtime})");
-            var ok = await _api.UploadFileAsync(item.Path, localPath);
-            if (ok)
+        // mtime 不同 → 别人修改/上传的，脱水本地文件
+        FileLogger.Log($"ModList: 云端变更，脱水本地: {item.Path} (cloud={cloudMtime}, local={localMtime})");
+        UpdateAndDehydrateFile(localPath, item.Mtime, item.Size);
+        SyncStatusManager.Instance.AddLog("☁️", $"云端已更新: {item.Path}");
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 为远程新文件创建本地占位符。
+    /// </summary>
+    private void CreatePlaceholderForFile(ModItem item, string localPath)
+    {
+        try
+        {
+            // 确保父目录存在
+            var parentDir = Path.GetDirectoryName(localPath);
+            if (parentDir != null) Directory.CreateDirectory(parentDir);
+
+            long fileTime = item.Mtime > 0
+                ? DateTimeOffset.FromUnixTimeSeconds(item.Mtime).ToFileTime()
+                : DateTimeOffset.UtcNow.ToFileTime();
+
+            byte[] identityBytes = System.Text.Encoding.UTF8.GetBytes(item.Path);
+
+            var placeholder = new CF_PLACEHOLDER_CREATE_INFO
             {
-                FileLogger.Log($"ModList: 上传成功: {item.Path}");
+                RelativeFileName = Marshal.StringToHGlobalUni(Path.GetFileName(localPath)),
+                FsMetadata = new CF_FS_METADATA
+                {
+                    BasicInfo_CreationTime = fileTime,
+                    BasicInfo_LastAccessTime = fileTime,
+                    BasicInfo_LastWriteTime = fileTime,
+                    BasicInfo_ChangeTime = fileTime,
+                    BasicInfo_FileAttributes = FILE_ATTRIBUTE_NORMAL,
+                    FileSize = item.Size,
+                },
+                FileIdentity = CopyToHGlobal(identityBytes),
+                FileIdentityLength = (uint)identityBytes.Length,
+                Flags = CF_PLACEHOLDER_CREATE_FLAGS.CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
+            };
+
+            try
+            {
+                int hr = CfCreatePlaceholders(
+                    parentDir!,
+                    new[] { placeholder },
+                    1,
+                    CF_CREATE_FLAGS.CF_CREATE_FLAG_NONE,
+                    out uint processed);
+
+                if (hr >= 0 && processed > 0)
+                {
+                    FileLogger.Log($"ModList: 创建占位符: {item.Path}");
+                    SyncStatusManager.Instance.AddLog("📄", $"新文件: {item.Path}");
+                }
+                else
+                {
+                    FileLogger.Log($"ModList: 创建占位符失败 0x{(uint)hr:X8}: {item.Path}");
+                }
+            }
+            finally
+            {
+                if (placeholder.RelativeFileName != IntPtr.Zero) Marshal.FreeHGlobal(placeholder.RelativeFileName);
+                if (placeholder.FileIdentity != IntPtr.Zero) Marshal.FreeHGlobal(placeholder.FileIdentity);
             }
         }
-        // mtime 一致 → 不需要任何操作
+        catch (Exception ex)
+        {
+            FileLogger.Log($"ModList: 创建占位符异常: {item.Path} - {ex.Message}");
+        }
+    }
+
+    private static IntPtr CopyToHGlobal(byte[] data)
+    {
+        IntPtr ptr = Marshal.AllocHGlobal(data.Length);
+        Marshal.Copy(data, 0, ptr, data.Length);
+        return ptr;
     }
 
     /// <summary>

@@ -65,6 +65,19 @@ public class ModListResponse
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  客户端注册 API 响应模型
+// ═══════════════════════════════════════════════════════════════
+
+public class RegisterClientResponse
+{
+    [JsonPropertyName("message")]
+    public string Message { get; set; } = "";
+
+    [JsonPropertyName("client_count")]
+    public int ClientCount { get; set; }
+}
+
+// ═══════════════════════════════════════════════════════════════
 
 /// <summary>
 /// 封装服务端同步 API 调用
@@ -79,6 +92,34 @@ public class SyncApiService
         _baseUrl = $"http://{server}/api/sync-config";
         _http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) }; // 大文件上传需要更长超时
         _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+    }
+
+    /// <summary>
+    /// 注册客户端，返回当前客户端数量。
+    /// </summary>
+    public async Task<int> RegisterClientAsync(string clientId, string hostname, string ip)
+    {
+        try
+        {
+            var url = $"{_baseUrl}/register-client";
+            var payload = JsonSerializer.Serialize(new { client_id = clientId, hostname, ip });
+            var content = new StringContent(payload, Encoding.UTF8, "application/json");
+            var response = await _http.PostAsync(url, content);
+            if (!response.IsSuccessStatusCode)
+            {
+                FileLogger.Log($"RegisterClient: HTTP {(int)response.StatusCode}");
+                return 1;
+            }
+            var json = await response.Content.ReadAsStringAsync();
+            var result = JsonSerializer.Deserialize<RegisterClientResponse>(json);
+            FileLogger.Log($"RegisterClient: {result?.Message}, client_count={result?.ClientCount}");
+            return result?.ClientCount ?? 1;
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"RegisterClient 异常: {ex.Message}");
+            return 1;
+        }
     }
 
     /// <summary>

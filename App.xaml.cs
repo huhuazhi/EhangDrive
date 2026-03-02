@@ -167,18 +167,36 @@ public partial class App : Application
             FileLogger.Log("InitialSync: 已完成，跳过全量同步");
         }
 
-        // ──── 全量同步完成后才启动 modlist 轮询 ─────────────────
-        if (initialSyncDone)
+        // ──── 注册客户端 ─────────────────────────────────────────
+        var clientId = ConfigService.GetOrCreateClientId();
+        var hostname = ConfigService.GetHostname();
+        var localIp = ConfigService.GetLocalIp();
+        int clientCount = 1;
+        try
+        {
+            clientCount = await api.RegisterClientAsync(clientId, hostname, localIp);
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"RegisterClient 异常: {ex.Message}");
+        }
+
+        // ──── 全量同步完成后且有多客户端时才启动 modlist 轮询 ────
+        if (initialSyncDone && clientCount >= 2)
         {
             _modListPoller = new ModListPollingService(api, newConfig.SyncFolder, _syncEngine);
-            FileLogger.Log("ModListPollingService 已启动（全量同步完成后）");
+            FileLogger.Log($"ModListPollingService 已启动（全量同步完成, {clientCount} 台客户端）");
+        }
+        else if (initialSyncDone && clientCount < 2)
+        {
+            FileLogger.Log($"ModListPollingService 未启动（仅 {clientCount} 台客户端，无需轮询）");
         }
         else
         {
             FileLogger.Log("ModListPollingService 未启动（全量同步未完成）");
         }
 
-        FileLogger.Log($"同步引擎+文件监听 已启动, folder={newConfig.SyncFolder}");
+        FileLogger.Log($"同步引擎+文件监听 已启动, folder={newConfig.SyncFolder}, clients={clientCount}");
 
         // ──── 清空上一轮的日志和传输列表 ─────────────────────────
         SyncStatusManager.Instance.Clear();
