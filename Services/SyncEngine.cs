@@ -79,11 +79,20 @@ public sealed class SyncEngine : IDisposable
     }
 
     /// <summary>
+    /// 待处理文件数 = 队列中尚未消费 + 正在上传中
+    /// </summary>
+    public int PendingCount => _channel.Reader.Count + _uploadingFiles.Count;
+
+    private void UpdatePendingCount()
+        => SyncStatusManager.Instance.PendingFileCount = PendingCount;
+
+    /// <summary>
     /// 生产者入口：丢一个同步事件进来，立即返回
     /// </summary>
     public void Enqueue(SyncEvent evt)
     {
         _channel.Writer.TryWrite(evt);
+        UpdatePendingCount();
     }
 
     /// <summary>
@@ -100,6 +109,10 @@ public sealed class SyncEngine : IDisposable
             catch (Exception ex)
             {
                 SyncStatusManager.Instance.AddLog("❌", $"处理异常: {ex.Message}");
+            }
+            finally
+            {
+                UpdatePendingCount();
             }
         }
     }
@@ -493,6 +506,7 @@ public sealed class SyncEngine : IDisposable
         {
             _uploadSemaphore.Release();
             _uploadingFiles.TryRemove(relativePath, out _);
+            UpdatePendingCount();
         }
     }
 
