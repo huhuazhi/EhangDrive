@@ -306,7 +306,7 @@ public sealed class SyncEngine : IDisposable
         catch { return; }
 
         FileLogger.Log($"  准备上传修改: {evt.RelativePath}");
-        await UploadFileWithRetry(evt.FullPath, evt.RelativePath);
+        await UploadFileWithRetry(evt.FullPath, evt.RelativePath, forceUpload: true);
     }
 
     /// <summary>
