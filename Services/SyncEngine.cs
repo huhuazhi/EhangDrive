@@ -193,9 +193,9 @@ public sealed class SyncEngine : IDisposable
 
         if (ok)
         {
-            // 目录不立即转 placeholder（空目录转了也是白云，且子文件上传时会清父 IN_SYNC）
-            // 加入脏目录列表，等所有文件传完后由 FlushDirtyDirectories 统一转 placeholder + IN_SYNC
-            _dirtyDirectories.TryAdd(evt.FullPath, 0);
+            // 目录不立即转 placeholder，也不加入脏目录列表
+            // 空目录即使转 placeholder + IN_SYNC 也显示白云，毫无意义
+            // 等子文件上传时 MarkParentDirectoriesDirty 自然会把父目录加入脏列表
             SyncStatusManager.Instance.AddLog("✅", $"文件夹已同步: {evt.RelativePath}");
         }
         else
@@ -514,6 +514,12 @@ public sealed class SyncEngine : IDisposable
         {
             _uploadSemaphore.Release();
             _uploadingFiles.TryRemove(relativePath, out _);
+
+            // 所有上传完成后，直接刷新脏目录（比依赖 Timer 更可靠）
+            if (PendingCount == 0 && HasDirtyDirectories)
+            {
+                FlushDirtyDirectories();
+            }
         }
     }
 
@@ -665,15 +671,15 @@ public sealed class SyncEngine : IDisposable
 
                 Marshal.FreeHGlobal(identityPtr);
 
-                // 0x8007017C = 已经是 placeholder，再单独设 IN_SYNC
-                if (hr == unchecked((int)0x8007017C))
-                {
-                    CfSetInSyncState(
-                        handle.DangerousGetHandle(),
-                        CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
-                        CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
-                        IntPtr.Zero);
-                }
+                // 无论 CfConvertToPlaceholder 返回什么，都显式设 IN_SYNC
+                // 成功(0): MARK_IN_SYNC 已设，再设一次无害
+                // 已是 placeholder(0x8007017C): 必须单独设
+                // 其他错误: 尝试设 IN_SYNC 也无害
+                CfSetInSyncState(
+                    handle.DangerousGetHandle(),
+                    CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                    CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                    IntPtr.Zero);
 
                 SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, dir);
             }
