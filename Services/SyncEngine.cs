@@ -127,7 +127,7 @@ public sealed class SyncEngine : IDisposable
     }
 
     /// <summary>
-    /// 处理新建文件夹：延迟等待重命名 → 调 mkdir API → 转为placeholder
+    /// 处理新建文件夹：延迟等待重命名 → 检测move → 调 mkdir API → 转为placeholder
     /// </summary>
     private async Task HandleCreateDirectory(SyncEvent evt)
     {
@@ -140,6 +140,18 @@ public sealed class SyncEngine : IDisposable
         if (!Directory.Exists(evt.FullPath))
         {
             FileLogger.Log($"  目录已不存在(可能已重命名)，跳过: {evt.FullPath}");
+            return;
+        }
+
+        // ── move 检测：HandleDelete 已非阻塞地把旧路径放进 _pendingDeletes ──
+        var dirName = Path.GetFileName(evt.RelativePath);
+        if (TryCancelPendingDelete(dirName, out var oldRelativePath))
+        {
+            FileLogger.Log($"  → 消费者侧检测到文件夹移动: {oldRelativePath} → {evt.RelativePath}");
+            await HandleRename(new SyncEvent(
+                SyncEventType.RenameItem,
+                evt.FullPath, evt.RelativePath,
+                null, oldRelativePath));
             return;
         }
 
@@ -180,9 +192,17 @@ public sealed class SyncEngine : IDisposable
         if (!ok)
         {
             // Fallback: 服务端可能还没有旧路径(Created被延迟跳过了)，直接创建新路径
-            FileLogger.Log($"  重命名失败，尝试直接创建: {evt.RelativePath}");
+            FileLogger.Log($"  重命名失败，尝试直接创建/上传: {evt.RelativePath}");
             if (Directory.Exists(evt.FullPath))
+            {
                 ok = await _api.MkdirAsync(evt.RelativePath);
+            }
+            else if (File.Exists(evt.FullPath))
+            {
+                // 文件 rename 失败（旧路径从未上传过），直接上传
+                await UploadFileWithRetry(evt.FullPath, evt.RelativePath);
+                return; // UploadFileWithRetry 内部已调用 ConvertToPlaceholderAndSync
+            }
         }
 
         if (ok)
@@ -197,7 +217,7 @@ public sealed class SyncEngine : IDisposable
     }
 
     /// <summary>
-    /// 处理新文件创建：等待写入完成 → 上传 → 转为placeholder
+    /// 处理新文件创建：先检测 move → 等待写入完成 → 上传 → 转为placeholder
     /// </summary>
     private async Task HandleCreateFile(SyncEvent evt)
     {
@@ -223,6 +243,18 @@ public sealed class SyncEngine : IDisposable
             }
         }
         catch { return; }
+
+        // ── move 检测：HandleDelete 已非阻塞地把旧路径放进 _pendingDeletes ──
+        var fileName = Path.GetFileName(evt.RelativePath);
+        if (TryCancelPendingDelete(fileName, out var oldRelativePath))
+        {
+            FileLogger.Log($"  → 消费者侧检测到文件移动: {oldRelativePath} → {evt.RelativePath}");
+            await HandleRename(new SyncEvent(
+                SyncEventType.RenameItem,
+                evt.FullPath, evt.RelativePath,
+                null, oldRelativePath));
+            return;
+        }
 
         await UploadFileWithRetry(evt.FullPath, evt.RelativePath);
     }
@@ -266,42 +298,48 @@ public sealed class SyncEngine : IDisposable
     }
 
     /// <summary>
-    /// 处理删除：延迟执行，防止 move（delete+create）被误删
+    /// 处理删除：立即入延迟队列并启动后台定时器，不阻塞消费者。
+    /// 这样后续的 Create 事件可以立即被处理，配合 move 检测。
     /// </summary>
-    private async Task HandleDelete(SyncEvent evt)
+    private Task HandleDelete(SyncEvent evt)
     {
         FileLogger.Log($"HandleDelete: {evt.RelativePath}");
 
-        // 入延迟队列
+        // 入延迟队列（立即返回，不阻塞消费者）
         _pendingDeletes[evt.RelativePath] = (evt.FullPath, DateTime.UtcNow.Ticks);
         SyncStatusManager.Instance.AddLog("🗑", $"检测到删除(排队): {evt.RelativePath}");
 
-        // 延迟 3 秒再检查：如果这期间出现同名 Created 事件（move 场景），则取消删除
-        await Task.Delay(3000);
-
-        if (!_pendingDeletes.TryRemove(evt.RelativePath, out var pending))
+        // 后台延迟 3 秒再检查：如果这期间出现同名 Created 事件（move 场景），则取消删除
+        _ = Task.Run(async () =>
         {
-            FileLogger.Log($"  延迟删除已被取消(可能是移动操作): {evt.RelativePath}");
-            return;
-        }
+            await Task.Delay(3000);
 
-        // 二次检查：本地是否又出现了
-        if (File.Exists(pending.fullPath) || Directory.Exists(pending.fullPath))
-        {
-            FileLogger.Log($"  取消删除(路径已恢复): {evt.RelativePath}");
-            SyncStatusManager.Instance.AddLog("🔙", $"取消删除(已恢复): {evt.RelativePath}");
-            return;
-        }
+            if (!_pendingDeletes.TryRemove(evt.RelativePath, out var pending))
+            {
+                FileLogger.Log($"  延迟删除已被取消(可能是移动操作): {evt.RelativePath}");
+                return;
+            }
 
-        // 执行服务端删除
-        SyncStatusManager.Instance.AddLog("🗑", $"删除服务端: {evt.RelativePath}");
-        var ok = await _api.DeleteAsync(evt.RelativePath);
-        FileLogger.Log($"  DeleteAsync → {ok}");
+            // 二次检查：本地是否又出现了
+            if (File.Exists(pending.fullPath) || Directory.Exists(pending.fullPath))
+            {
+                FileLogger.Log($"  取消删除(路径已恢复): {evt.RelativePath}");
+                SyncStatusManager.Instance.AddLog("🔙", $"取消删除(已恢复): {evt.RelativePath}");
+                return;
+            }
 
-        if (ok)
-            SyncStatusManager.Instance.AddLog("✅", $"服务端已删除: {evt.RelativePath}");
-        else
-            SyncStatusManager.Instance.AddLog("❌", $"服务端删除失败: {evt.RelativePath}");
+            // 执行服务端删除
+            SyncStatusManager.Instance.AddLog("🗑", $"删除服务端: {evt.RelativePath}");
+            var ok = await _api.DeleteAsync(evt.RelativePath);
+            FileLogger.Log($"  DeleteAsync → {ok}");
+
+            if (ok)
+                SyncStatusManager.Instance.AddLog("✅", $"服务端已删除: {evt.RelativePath}");
+            else
+                SyncStatusManager.Instance.AddLog("❌", $"服务端删除失败: {evt.RelativePath}");
+        });
+
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -513,6 +551,11 @@ public sealed class SyncEngine : IDisposable
 
             // 通知 Explorer 刷新文件图标覆盖（解决蓝圈不自动变绿勾的问题）
             SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, fullPath);
+
+            // 同时通知父目录刷新聚合同步状态
+            var parentDir = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrEmpty(parentDir))
+                SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, parentDir);
         }
         catch (Exception ex)
         {
@@ -550,6 +593,7 @@ public sealed class SyncEngine : IDisposable
 
     // SHChangeNotify 常量
     private const uint SHCNE_UPDATEITEM = 0x00002000;
+    private const uint SHCNE_UPDATEDIR  = 0x00001000;
     private const uint SHCNF_PATHW = 0x0005;
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
