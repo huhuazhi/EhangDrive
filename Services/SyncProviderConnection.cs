@@ -23,7 +23,6 @@ public sealed class SyncProviderConnection : IDisposable
     private CF_CALLBACK? _fetchPlaceholdersCallback;
     private CF_CALLBACK? _fetchDataCallback;
     private CF_CALLBACK? _notifyDehydrateCallback;
-    private CF_CALLBACK? _validateDataCallback;
 
     /// <summary>
     /// 连接到已注册的同步根目录
@@ -39,7 +38,6 @@ public sealed class SyncProviderConnection : IDisposable
         _fetchPlaceholdersCallback = OnFetchPlaceholders;
         _fetchDataCallback = OnFetchData;
         _notifyDehydrateCallback = OnNotifyDehydrate;
-        _validateDataCallback = OnValidateData;
 
         var callbackTable = new CF_CALLBACK_REGISTRATION[]
         {
@@ -57,11 +55,6 @@ public sealed class SyncProviderConnection : IDisposable
             {
                 Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE,
                 Callback = Marshal.GetFunctionPointerForDelegate(_notifyDehydrateCallback)
-            },
-            new()
-            {
-                Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_VALIDATE_DATA,
-                Callback = Marshal.GetFunctionPointerForDelegate(_validateDataCallback)
             },
             CF_CALLBACK_REGISTRATION.CF_CALLBACK_REGISTRATION_END
         };
@@ -388,193 +381,6 @@ public sealed class SyncProviderConnection : IDisposable
             return path.Substring(syncRoot.Length + 1).Replace('\\', '/');
 
         return "";
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  VALIDATE_DATA 短期缓存：防止同一文件短时间内重复走网络检查
-    // ═══════════════════════════════════════════════════════════════
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _validateCache = new();
-    private const long ValidateCacheTicks = 30 * TimeSpan.TicksPerSecond; // 30 秒缓存
-
-    /// <summary>
-    /// VALIDATE_DATA 回调 — 打开已 hydrated 文件时触发。
-    /// 比较本地 mtime 和云端 mtime：
-    ///   - 云端更新 → ACK 失败，Windows 使缓存失效 → 触发 FETCH_DATA 重新下载
-    ///   - 本地更新 → ACK 成功，正常打开，异步上传本地文件到云端
-    ///   - 一致 → ACK 成功，正常打开
-    /// </summary>
-    private static void OnValidateData(IntPtr callbackInfoPtr, IntPtr callbackParamsPtr)
-    {
-        try
-        {
-            long connectionKey = CallbackInfoReader.GetConnectionKey(callbackInfoPtr);
-            long transferKey = CallbackInfoReader.GetTransferKey(callbackInfoPtr);
-            long requestKey = CallbackInfoReader.GetRequestKey(callbackInfoPtr);
-            IntPtr correlationVector = CallbackInfoReader.GetCorrelationVector(callbackInfoPtr);
-            string normalizedPath = CallbackInfoReader.GetNormalizedPathString(callbackInfoPtr);
-            string relativePath = GetRelativePath(normalizedPath);
-
-            FileLogger.Log($"VALIDATE_DATA: {relativePath}");
-
-            // 转换为本地完整路径
-            string localPath = normalizedPath;
-            if (localPath.StartsWith(@"\?\"))
-                localPath = localPath.Substring(4);
-            if (localPath.Length >= 2 && localPath[1] != ':' && _syncFolder != null)
-            {
-                // volume-relative path → full path
-                localPath = _syncFolder![0] + ":" + localPath;
-            }
-
-            // 短期缓存：30 秒内不重复检查
-            if (_validateCache.TryGetValue(relativePath, out long cachedTick) &&
-                (DateTime.UtcNow.Ticks - cachedTick) < ValidateCacheTicks)
-            {
-                FileLogger.Log($"  VALIDATE_DATA 缓存命中，放行: {relativePath}");
-                AckData(connectionKey, transferKey, requestKey, correlationVector, 0); // STATUS_SUCCESS
-                return;
-            }
-
-            // 查询云端文件元数据（带超时保护）
-            TreeItem? remoteMeta = null;
-            try
-            {
-                var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(5));
-                remoteMeta = Task.Run(() => _api!.GetFileMetaAsync(relativePath), cts.Token)
-                    .GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                FileLogger.Log($"  查询云端失败（放行）: {ex.Message}");
-                _validateCache[relativePath] = DateTime.UtcNow.Ticks;
-                AckData(connectionKey, transferKey, requestKey, correlationVector, 0);
-                return;
-            }
-
-            if (remoteMeta == null)
-            {
-                // 云端不存在此文件 → 本地是新文件，正常打开，异步上传
-                FileLogger.Log($"  云端无此文件，放行并异步上传: {relativePath}");
-                _validateCache[relativePath] = DateTime.UtcNow.Ticks;
-                AckData(connectionKey, transferKey, requestKey, correlationVector, 0);
-                _ = Task.Run(async () =>
-                {
-                    try { await _api!.UploadFileAsync(relativePath, localPath); }
-                    catch { }
-                });
-                return;
-            }
-
-            // 比较 mtime
-            long remoteMtime = remoteMeta.Mtime; // Unix seconds
-            long localMtime = 0;
-            try
-            {
-                localMtime = new DateTimeOffset(File.GetLastWriteTimeUtc(localPath)).ToUnixTimeSeconds();
-            }
-            catch
-            {
-                FileLogger.Log($"  获取本地 mtime 失败，放行");
-                _validateCache[relativePath] = DateTime.UtcNow.Ticks;
-                AckData(connectionKey, transferKey, requestKey, correlationVector, 0);
-                return;
-            }
-
-            FileLogger.Log($"  本地mtime={localMtime}, 云端mtime={remoteMtime}");
-
-            if (remoteMtime > localMtime)
-            {
-                // 云端更新 → ACK 失败，使缓存失效，Windows 会触发 FETCH_DATA 重新下载
-                FileLogger.Log($"  云端更新！ACK失败使缓存失效，将重新下载: {relativePath}");
-                // 先脱水本地文件，再 ACK 成功让 Windows 重新 FETCH_DATA
-                _ = Task.Run(() =>
-                {
-                    try
-                    {
-                        IntPtr handle = CreateFileW(
-                            localPath,
-                            0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
-                            0x00000007,
-                            IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
-                        if (handle != IntPtr.Zero && handle != new IntPtr(-1))
-                        {
-                            try
-                            {
-                                CfDehydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
-                                FileLogger.Log($"  已脱水: {relativePath}，等待重新 hydrate");
-                            }
-                            finally { CloseHandle(handle); }
-                        }
-                    }
-                    catch { }
-                });
-                _validateCache.TryRemove(relativePath, out _);
-                AckData(connectionKey, transferKey, requestKey, correlationVector, 0);
-            }
-            else if (localMtime > remoteMtime)
-            {
-                // 本地更新 → ACK 成功放行，异步上传到云端
-                FileLogger.Log($"  本地更新！放行并异步上传: {relativePath}");
-                _validateCache[relativePath] = DateTime.UtcNow.Ticks;
-                AckData(connectionKey, transferKey, requestKey, correlationVector, 0);
-                _ = Task.Run(async () =>
-                {
-                    try { await _api!.UploadFileAsync(relativePath, localPath); }
-                    catch { }
-                });
-            }
-            else
-            {
-                // mtime 一致 → 直接放行
-                FileLogger.Log($"  mtime 一致，放行: {relativePath}");
-                _validateCache[relativePath] = DateTime.UtcNow.Ticks;
-                AckData(connectionKey, transferKey, requestKey, correlationVector, 0);
-            }
-        }
-        catch (Exception ex)
-        {
-            FileLogger.Log($"  VALIDATE_DATA 异常: {ex.Message}\n{ex.StackTrace}");
-            // 出错也要 ACK 放行，否则文件打不开
-            try
-            {
-                long ck = CallbackInfoReader.GetConnectionKey(callbackInfoPtr);
-                long tk = CallbackInfoReader.GetTransferKey(callbackInfoPtr);
-                long rk = CallbackInfoReader.GetRequestKey(callbackInfoPtr);
-                IntPtr cv = CallbackInfoReader.GetCorrelationVector(callbackInfoPtr);
-                AckData(ck, tk, rk, cv, 0);
-            }
-            catch { }
-        }
-    }
-
-    /// <summary>
-    /// 发送 ACK_DATA 响应
-    /// </summary>
-    private static void AckData(long connectionKey, long transferKey, long requestKey,
-        IntPtr correlationVector, int completionStatus)
-    {
-        var opInfo = new CF_OPERATION_INFO
-        {
-            StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
-            Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_ACK_DATA,
-            ConnectionKey = connectionKey,
-            TransferKey = transferKey,
-            CorrelationVector = correlationVector,
-            SyncStatus = IntPtr.Zero,
-            RequestKey = requestKey,
-        };
-
-        var opParams = new CF_OPERATION_PARAMETERS_ACKDATA
-        {
-            ParamSize = (uint)Marshal.SizeOf<CF_OPERATION_PARAMETERS_ACKDATA>(),
-            Flags = 0,
-            CompletionStatus = completionStatus,
-            Offset = 0,
-            Length = 0,
-        };
-
-        int hr = CfExecute(in opInfo, ref opParams);
-        FileLogger.Log($"  ACK_DATA → 0x{hr:X8} (status=0x{completionStatus:X8})");
     }
 
     /// <summary>

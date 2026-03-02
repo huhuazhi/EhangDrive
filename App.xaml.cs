@@ -13,6 +13,7 @@ public partial class App : Application
     private TrayIconService? _trayIcon;
     private SyncEngine? _syncEngine;
     private FileWatcherService? _fileWatcher;
+    private ModListPollingService? _modListPoller;
     private MainWindow? _mainWindow;
     private string? _currentUsername;
 
@@ -133,7 +134,11 @@ public partial class App : Application
 
         _fileWatcher = new FileWatcherService(newConfig.SyncFolder, _syncEngine);
         _fileWatcher.Start();
-        FileLogger.Log($"同步引擎+文件监听 已启动, folder={newConfig.SyncFolder}");
+
+        // ──── 启动 modlist 轮询（检测其他客户端的文件修改）────
+        _modListPoller = new ModListPollingService(api, newConfig.SyncFolder, _syncEngine);
+
+        FileLogger.Log($"同步引擎+文件监听+modlist轮询 已启动, folder={newConfig.SyncFolder}");
 
         // ──── 清空上一轮的日志和传输列表 ─────────────────────────
         SyncStatusManager.Instance.Clear();
@@ -230,6 +235,8 @@ public partial class App : Application
 
     private void CleanupSession()
     {
+        _modListPoller?.Dispose();
+        _modListPoller = null;
         _fileWatcher?.Dispose();
         _fileWatcher = null;
         _syncEngine?.Dispose();

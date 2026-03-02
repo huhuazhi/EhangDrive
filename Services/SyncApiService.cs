@@ -40,6 +40,31 @@ public class TreeResponse
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  服务端 /modlist API 响应模型
+// ═══════════════════════════════════════════════════════════════
+
+public class ModItem
+{
+    [JsonPropertyName("path")]
+    public string Path { get; set; } = "";
+
+    [JsonPropertyName("mtime")]
+    public long Mtime { get; set; }
+
+    [JsonPropertyName("size")]
+    public long Size { get; set; }
+
+    [JsonPropertyName("action")]
+    public string Action { get; set; } = "update";
+}
+
+public class ModListResponse
+{
+    [JsonPropertyName("items")]
+    public List<ModItem> Items { get; set; } = new();
+}
+
+// ═══════════════════════════════════════════════════════════════
 
 /// <summary>
 /// 封装服务端同步 API 调用
@@ -81,6 +106,31 @@ public class SyncApiService
         {
             FileLogger.Log($"  ListDirectoryAsync 异常: {ex.Message}");
             return new List<TreeItem>();
+        }
+    }
+
+    /// <summary>
+    /// 获取服务端文件修改列表（调用 GET /modlist）
+    /// </summary>
+    public async Task<List<ModItem>> GetModListAsync()
+    {
+        try
+        {
+            var url = $"{_baseUrl}/modlist";
+            var response = await _http.GetAsync(url);
+            if (!response.IsSuccessStatusCode)
+            {
+                FileLogger.Log($"GetModListAsync: HTTP {(int)response.StatusCode}");
+                return new List<ModItem>();
+            }
+            var json = await response.Content.ReadAsStringAsync();
+            var result = JsonSerializer.Deserialize<ModListResponse>(json);
+            return result?.Items ?? new List<ModItem>();
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"GetModListAsync 异常: {ex.Message}");
+            return new List<ModItem>();
         }
     }
 
