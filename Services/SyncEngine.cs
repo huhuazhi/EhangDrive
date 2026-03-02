@@ -193,9 +193,10 @@ public sealed class SyncEngine : IDisposable
 
         if (ok)
         {
-            // 目录不立即转 placeholder，也不加入脏目录列表
-            // 空目录即使转 placeholder + IN_SYNC 也显示白云，毫无意义
-            // 等子文件上传时 MarkParentDirectoriesDirty 自然会把父目录加入脏列表
+            // 目录不立即转 placeholder（避免白费功夫被子文件清掉）
+            // 加入脏目录列表，由 FlushDirtyDirectories 统一转 placeholder + IN_SYNC
+            // 空目录转完虽然是白云，但至少比蓝圈正常（表示已是云端文件）
+            _dirtyDirectories.TryAdd(evt.FullPath, 0);
             SyncStatusManager.Instance.AddLog("✅", $"文件夹已同步: {evt.RelativePath}");
         }
         else

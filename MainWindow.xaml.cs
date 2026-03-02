@@ -39,16 +39,27 @@ public partial class MainWindow : Window
         LoadSettings();
 
         // 每秒刷新剩余文件数 + 检查脏目录
+        int _idleSeconds = 0;
         var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         timer.Tick += (_, _) =>
         {
             int count = _syncEngine?.PendingCount ?? 0;
             TxtPendingCount.Text = count > 0 ? $"(剩余 {count} 个)" : "";
 
-            // 队列空闲且有脏目录时，统一刷新父目录 IN_SYNC
+            // 队列空闲且有脏目录时，等连续空闲 2 秒再刷新
+            // 避免目录创建后立刻 flush（子文件事件可能还没到）
             if (count == 0 && (_syncEngine?.HasDirtyDirectories ?? false))
             {
-                Task.Run(() => _syncEngine?.FlushDirtyDirectories());
+                _idleSeconds++;
+                if (_idleSeconds >= 2)
+                {
+                    _idleSeconds = 0;
+                    Task.Run(() => _syncEngine?.FlushDirtyDirectories());
+                }
+            }
+            else
+            {
+                _idleSeconds = 0;
             }
         };
         timer.Start();
