@@ -117,6 +117,9 @@ public class SyncStatusManager : INotifyPropertyChanged
             while (Logs.Count > 200)
                 Logs.RemoveAt(Logs.Count - 1);
         });
+
+        // 触发托盘图标绿点闪烁（硬盘灯效果）
+        Services.TrayIconService.Current?.NotifyActivity();
     }
 
     public void AddTransfer(TransferItem item)
@@ -128,6 +131,9 @@ public class SyncStatusManager : INotifyPropertyChanged
             while (Transfers.Count > 50)
                 Transfers.RemoveAt(Transfers.Count - 1);
         });
+
+        // 有新传输任务 → 标记忙碌
+        Services.TrayIconService.Current?.BeginBusy();
     }
 
     public void RemoveTransfer(TransferItem item)
@@ -136,6 +142,9 @@ public class SyncStatusManager : INotifyPropertyChanged
         {
             Transfers.Remove(item);
         });
+
+        // 传输任务移除 → 取消一个忙碌计数
+        Services.TrayIconService.Current?.EndBusy();
     }
 
     public void Clear()

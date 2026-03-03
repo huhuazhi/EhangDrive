@@ -180,6 +180,7 @@ public partial class App : Application
         {
             FileLogger.Log("InitialSync: 未完成标记，执行全量同步...");
             SyncStatusManager.Instance.AddLog("🔄", "正在执行全量同步...");
+            TrayIconService.Current?.BeginBusy("全量同步");
             try
             {
                 await InitialSyncService.SyncAsync(api, newConfig.SyncFolder);
@@ -188,6 +189,10 @@ public partial class App : Application
             catch (Exception ex)
             {
                 FileLogger.Log($"InitialSync 异常: {ex.Message}");
+            }
+            finally
+            {
+                TrayIconService.Current?.EndBusy();
             }
         }
         else
@@ -217,6 +222,7 @@ public partial class App : Application
             InitialSyncService.ClearMarker(newConfig.SyncFolder);
             initialSyncDone = false;
             SyncStatusManager.Instance.AddLog("🔄", "服务端要求重新全量同步...");
+            TrayIconService.Current?.BeginBusy("重新全量同步");
             try
             {
                 await InitialSyncService.SyncAsync(api, newConfig.SyncFolder);
@@ -225,6 +231,10 @@ public partial class App : Application
             catch (Exception ex)
             {
                 FileLogger.Log($"重新全量同步异常: {ex.Message}");
+            }
+            finally
+            {
+                TrayIconService.Current?.EndBusy();
             }
         }
 
