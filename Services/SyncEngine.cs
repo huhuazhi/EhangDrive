@@ -45,6 +45,9 @@ public sealed class SyncEngine : IDisposable
     // Changed 去重：同一文件 2 秒内不重复上传
     private readonly ConcurrentDictionary<string, long> _lastChangedTicks = new(StringComparer.OrdinalIgnoreCase);
 
+    // 上传成功后记录文件的 mtime，用于防止 CfConvertToPlaceholder 触发的 Changed 事件引起重复上传
+    private readonly ConcurrentDictionary<string, long> _lastUploadedMtime = new(StringComparer.OrdinalIgnoreCase);
+
     // 延迟删除队列（防止 move = delete + create 导致误删服务端文件）
     // key=relativePath, value=(fullPath, enqueueTicks)
     private readonly ConcurrentDictionary<string, (string fullPath, long ticks)> _pendingDeletes = new(StringComparer.OrdinalIgnoreCase);
@@ -433,6 +436,16 @@ public sealed class SyncEngine : IDisposable
             // Cloud Filter placeholder 被用户修改后 ReparsePoint 仍然保留，
             // 但内容已经变了，必须重新上传。
             // 反馈事件已在 OnChanged 中被 IsRecentlySynced(2秒) 过滤。
+
+            // 但如果文件是 placeholder 且 mtime 未变（说明内容没有被修改，
+            // Changed 事件只是 CfConvertToPlaceholder/脱水等属性变化引起的），可以跳过
+            if (fi.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint) &&
+                _lastUploadedMtime.TryGetValue(evt.RelativePath, out var lastMtime) &&
+                fi.LastWriteTimeUtc.Ticks == lastMtime)
+            {
+                FileLogger.Log($"  跳过(placeholder mtime未变): {evt.RelativePath}");
+                return;
+            }
         }
         catch { return; }
 
@@ -583,6 +596,8 @@ public sealed class SyncEngine : IDisposable
                         FileLogger.Log($"  上传成功: {relativePath}");
                         // 上传成功后立即设置 debounce，防止队列中积压的 ModifyFile 引发链式重复上传
                         _lastChangedTicks[relativePath] = DateTime.UtcNow.Ticks;
+                        // 记录文件 mtime，用于在后续 HandleModifyFile 中判断文件是否真正被修改
+                        try { _lastUploadedMtime[relativePath] = new FileInfo(fullPath).LastWriteTimeUtc.Ticks; } catch { }
                         ConvertToPlaceholderAndSync(fullPath, relativePath);
                         transferItem.Progress = 100;
                         transferItem.Status = TransferStatus.Completed;
@@ -609,6 +624,7 @@ public sealed class SyncEngine : IDisposable
             }
 
             // 上传失败
+            FileLogger.Log($"  上传最终失败(5次重试均失败): {relativePath}");
             transferItem.Status = TransferStatus.Failed;
             SyncStatusManager.Instance.AddLog("❌", $"上传失败: {relativePath}");
         }
@@ -706,16 +722,16 @@ public sealed class SyncEngine : IDisposable
             else
                 FileLogger.Log($"  CfConvertToPlaceholder → 0x{hr:X8}");
 
-            // 目录的 IN_SYNC 由 FlushDirtyDirectories 统一设置，这里只给文件设
-            if (!isDir)
-            {
-                hr = CfSetInSyncState(
-                    handle.DangerousGetHandle(),
-                    CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
-                    CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
-                    IntPtr.Zero);
-                FileLogger.Log($"  CfSetInSyncState → 0x{hr:X8}");
-            }
+            // 文件和目录都设置 IN_SYNC：
+            // - 文件：在此处直接设置
+            // - 目录：也在此处设置（修复重命名后目录无绿勾的问题）
+            //   父目录的 IN_SYNC 由 FlushDirtyDirectories 统一处理
+            hr = CfSetInSyncState(
+                handle.DangerousGetHandle(),
+                CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                IntPtr.Zero);
+            FileLogger.Log($"  CfSetInSyncState → 0x{hr:X8}");
 
             // 通知 Explorer 刷新文件图标覆盖（解决蓝圈不自动变绿勾的问题）
             SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, fullPath);
