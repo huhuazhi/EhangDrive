@@ -33,6 +33,17 @@ public sealed class SyncProviderConnection : IDisposable
     /// </summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _dehydrateCooldown = new(StringComparer.OrdinalIgnoreCase);
 
+    // ERROR_MORE_DATA: CfGetPlaceholderInfo 缓冲区不够装完整结构（含可变长 FileName），
+    // 但前面的固定字段（PinState 等）已成功写入，可以安全读取。
+    private const int HRESULT_ERROR_MORE_DATA = unchecked((int)0x800700EA);
+
+    /// <summary>
+    /// 判断 CfGetPlaceholderInfo 是否成功读取了 PinState（offset 0, 4 bytes）。
+    /// ERROR_MORE_DATA 说明缓冲区不够装完整结构但 PinState 已写入。
+    /// </summary>
+    private static bool IsPinStateReadable(int hr, uint retLen)
+        => (hr >= 0 || hr == HRESULT_ERROR_MORE_DATA) && retLen >= 4;
+
     /// <summary>
     /// 连接到已注册的同步根目录
     /// </summary>
@@ -318,7 +329,7 @@ public sealed class SyncProviderConnection : IDisposable
                     // InfoClass = 1 → CF_PLACEHOLDER_INFO_BASIC
                     // 第一个 DWORD = PinState; UNPINNED = 2
                     int hr = CfGetPlaceholderInfo(handle, 1, buf, 256, out uint retLen);
-                    if (hr < 0 || retLen < 4) return false;
+                    if (!IsPinStateReadable(hr, retLen)) return false;
 
                     uint pinState = (uint)Marshal.ReadInt32(buf, 0);
                     if (pinState != 2) return false; // 不是 UNPINNED
@@ -351,7 +362,7 @@ public sealed class SyncProviderConnection : IDisposable
                                 try
                                 {
                                     int phr = CfGetPlaceholderInfo(fh, 1, fileBuf, 64, out uint fRetLen);
-                                    if (phr >= 0 && fRetLen >= 4)
+                                    if (IsPinStateReadable(phr, fRetLen))
                                     {
                                         uint filePinState = (uint)Marshal.ReadInt32(fileBuf, 0);
                                         if (filePinState == 1) // PINNED
@@ -443,11 +454,7 @@ public sealed class SyncProviderConnection : IDisposable
                 {
                     // InfoClass = 1 → CF_PLACEHOLDER_INFO_BASIC，PinState 在偏移 0
                     int hr = CfGetPlaceholderInfo(handle, 1, buf, 64, out uint retLen);
-                    if (hr < 0 || retLen < 4)
-                    {
-                        FileLogger.Log($"TryHandlePinRequest: CfGetPlaceholderInfo 失败 hr=0x{(uint)hr:X8} retLen={retLen}: {fullPath}");
-                        return false;
-                    }
+                    if (!IsPinStateReadable(hr, retLen)) return false;
 
                     uint pinState = (uint)Marshal.ReadInt32(buf, 0);
                     if (pinState != 1) return false; // 不是 PINNED
@@ -490,7 +497,7 @@ public sealed class SyncProviderConnection : IDisposable
                 try
                 {
                     int hr = CfGetPlaceholderInfo(handle, 1, buf, 64, out uint retLen);
-                    if (hr < 0 || retLen < 4) return -1;
+                    if (!IsPinStateReadable(hr, retLen)) return -1;
                     return Marshal.ReadInt32(buf, 0);
                 }
                 finally { Marshal.FreeHGlobal(buf); }
@@ -760,7 +767,7 @@ public sealed class SyncProviderConnection : IDisposable
                         try
                         {
                             int phr = CfGetPlaceholderInfo(fh, 1, buf, 64, out uint retLen);
-                            if (phr >= 0 && retLen >= 4)
+                            if (IsPinStateReadable(phr, retLen))
                             {
                                 uint pinState = (uint)Marshal.ReadInt32(buf, 0);
                                 if (pinState == 1) // PINNED
