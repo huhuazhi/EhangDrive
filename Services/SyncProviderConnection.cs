@@ -27,6 +27,13 @@ public sealed class SyncProviderConnection : IDisposable
     private CF_CALLBACK? _notifyDehydrateCallback;
 
     /// <summary>
+    /// 脱水冷却：记录每个路径最后一次脱水时间，防止重复脱水导致的无限循环。
+    /// 目录 UNPINNED 状态是永久的，每次子文件变化都会触发父目录 Changed 事件，
+    /// 若不加冷却，会导致反复脱水→水合→脱水的无限循环。
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _dehydrateCooldown = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// 连接到已注册的同步根目录
     /// </summary>
     /// <summary>
@@ -274,6 +281,14 @@ public sealed class SyncProviderConnection : IDisposable
             bool isFile = !isDir && File.Exists(fullPath);
             if (!isDir && !isFile) return false;
 
+            // 冷却检查：同一路径 60 秒内不重复脱水
+            var nowTicks = DateTime.UtcNow.Ticks;
+            if (_dehydrateCooldown.TryGetValue(fullPath, out var lastTicks))
+            {
+                if ((nowTicks - lastTicks) < TimeSpan.TicksPerSecond * 60)
+                    return true; // 仍在冷却期，静默跳过（返回 true 阻止后续 Changed 处理）
+            }
+
             IntPtr handle = CreateFileW(
                 fullPath,
                 0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
@@ -329,6 +344,7 @@ public sealed class SyncProviderConnection : IDisposable
                         catch { }
                     }
                     FileLogger.Log($"  已释放空间: {fullPath} ({count}个文件)");
+                    _dehydrateCooldown[fullPath] = DateTime.UtcNow.Ticks;
                     return true;
                 }
                 else
@@ -343,6 +359,7 @@ public sealed class SyncProviderConnection : IDisposable
                     if (dhr >= 0)
                     {
                         FileLogger.Log($"  已释放空间: {fullPath}");
+                        _dehydrateCooldown[fullPath] = DateTime.UtcNow.Ticks;
                         return true;
                     }
                     else
