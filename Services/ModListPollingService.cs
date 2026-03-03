@@ -57,11 +57,20 @@ public sealed class ModListPollingService : IDisposable
 
     private async Task PollOnce()
     {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         var items = await _api.GetModListAsync();
-        if (items.Count == 0) return;
+        sw.Stop();
 
+        if (items.Count == 0)
+        {
+            FileLogger.Log($"ModList 轮询: 0 条变更, 耗时 {sw.ElapsedMilliseconds}ms");
+            return;
+        }
+
+        FileLogger.Log($"ModList 轮询: {items.Count} 条变更, API耗时 {sw.ElapsedMilliseconds}ms");
         foreach (var item in items)
         {
+            FileLogger.Log($"  → [{item.Action}] {(item.IsDir ? "目录" : "文件")} {item.Path}{(string.IsNullOrEmpty(item.OldPath) ? "" : $" (from {item.OldPath})")}");
             try
             {
                 await ProcessModItem(item);

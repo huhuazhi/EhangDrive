@@ -71,9 +71,23 @@ public static class InitialSyncService
     /// </summary>
     private static string GetMarkerPath(string syncFolder)
     {
-        // 用同步目录路径的哈希做文件名，避免路径字符问题
-        var hash = syncFolder.ToLowerInvariant().GetHashCode();
+        // 用确定性哈希做文件名（string.GetHashCode() 在 .NET 8 每次进程启动值不同）
+        var hash = DeterministicHash(syncFolder.ToLowerInvariant());
         return Path.Combine(StateDir, $"initial_sync_done_{hash:X8}.marker");
+    }
+
+    /// <summary>
+    /// 确定性哈希，跨进程重启结果一致（替代 string.GetHashCode 的随机化行为）。
+    /// </summary>
+    private static uint DeterministicHash(string s)
+    {
+        uint hash = 2166136261u; // FNV-1a offset basis
+        foreach (char c in s)
+        {
+            hash ^= c;
+            hash *= 16777619u; // FNV-1a prime
+        }
+        return hash;
     }
 
     /// <summary>
@@ -128,6 +142,12 @@ public static class InitialSyncService
         }
 
         if (items.Count == 0) return (0, 1, 0, 0, 0);
+
+        // UI 日志：显示正在扫描的目录和条目数
+        int dirItemCount = items.Count(i => i.IsDir);
+        int fileItemCount = items.Count(i => !i.IsDir);
+        string displayPath = string.IsNullOrEmpty(relativePath) ? "/" : relativePath;
+        SyncStatusManager.Instance.AddLog("📂", $"{displayPath}  ({dirItemCount}个目录, {fileItemCount}个文件)");
 
         // 本地目录完整路径
         string localDir = string.IsNullOrEmpty(relativePath)
@@ -189,6 +209,7 @@ public static class InitialSyncService
                                 toCreate.Add(item);
                                 replaced++;
                                 FileLogger.Log($"InitialSync: 服务器更新，替换本地文件: {childRelPath} (本地={localMtime:u} 服务器={serverMtime:u})");
+                                SyncStatusManager.Instance.AddLog("🔄", $"服务器更新: {childRelPath}");
                             }
                             catch (Exception ex)
                             {
@@ -200,6 +221,7 @@ public static class InitialSyncService
                             // 本地更新 → 需要上传到服务器
                             toUpload.Add((childLocalPath, childRelPath));
                             FileLogger.Log($"InitialSync: 本地更新，需上传: {childRelPath} (本地={localMtime:u} 服务器={serverMtime:u})");
+                            SyncStatusManager.Instance.AddLog("⬆️", $"本地更新: {childRelPath}");
                         }
                         // else: 时间戳接近（差值≤2秒），视为相同，跳过
                     }
@@ -215,6 +237,7 @@ public static class InitialSyncService
         if (toCreate.Count > 0)
         {
             created = CreatePlaceholders(localDir, relativePath, toCreate);
+            SyncStatusManager.Instance.AddLog("✨", $"新建 {created} 个占位符: {displayPath}");
         }
 
         // 上传本地更新的文件到服务器
@@ -228,6 +251,7 @@ public static class InitialSyncService
                 {
                     uploaded++;
                     FileLogger.Log($"InitialSync: 已上传本地更新文件: {relPath}");
+                    SyncStatusManager.Instance.AddLog("✅", $"已上传: {relPath}");
                 }
                 else
                 {

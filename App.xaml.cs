@@ -33,6 +33,7 @@ public partial class App : Application
 
         // 防止关闭最后一个窗口时退出应用（托盘模式）
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        FileLogger.CleanupOldLogs();          // 启动时清理 7 天前的旧日志
         FileLogger.Log("========== 应用启动 ==========");
         await StartSession();
     }
