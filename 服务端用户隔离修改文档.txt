@@ -1,0 +1,356 @@
+=====================================
+  服务端用户隔离改造方案
+=====================================
+
+【当前问题】
+1. sync_clients 表没有 username 字段，GET /clients 返回所有用户的客户端，用户 A 能看到用户 B 的机器
+2. file_changes 表没有 username 字段，用户 A 的变更通知会发给用户 B 的客户端
+3. _active_client_count() 全局计数，不分用户，影响 modlist 记录开关
+4. 用户 A 可以调用 remove-client 删除用户 B 的客户端
+
+【改造目标】
+所有客户端管理和变更通知按 username 完全隔离。
+客户端注册时传递 username，服务端从 Bearer Token 解析出 username 并校验。
+
+
+=====================================
+  修改文件
+=====================================
+
+/home/hhz/.openclaw/workspace/nas-project/backend/db/__init__.py
+/home/hhz/.openclaw/workspace/nas-project/backend/sync_config/__init__.py
+
+
+=====================================
+  修改 1：数据库迁移 - sync_clients 表加 username 列
+=====================================
+
+文件：/home/hhz/.openclaw/workspace/nas-project/backend/db/__init__.py
+位置：迁移函数中
+
+在 sync_clients 表的迁移逻辑中追加 username 列：
+
+    # ── sync_clients 表加 username 列 ──
+    cols = [c["name"] for c in inspect(engine).get_columns("sync_clients")]
+    if "username" not in cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE sync_clients ADD COLUMN username TEXT NOT NULL DEFAULT ''"))
+        print("[DB] Added username to sync_clients")
+
+
+=====================================
+  修改 2：数据库迁移 - file_changes 表加 username 列
+=====================================
+
+文件：/home/hhz/.openclaw/workspace/nas-project/backend/db/__init__.py
+位置：_migrate_modlist_table() 函数中，在 old_path 迁移之后
+
+    # ── file_changes 表加 username 列 ──
+    cols = [c["name"] for c in inspect(engine).get_columns("file_changes")]
+    if "username" not in cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE file_changes ADD COLUMN username TEXT NOT NULL DEFAULT ''"))
+        print("[DB] Added username to file_changes")
+
+
+=====================================
+  修改 3：_active_client_count() 按 username 过滤
+=====================================
+
+文件：sync_config/__init__.py
+
+--- 修改前 ---
+def _active_client_count():
+    """获取活跃客户端数量"""
+    try:
+        db = SessionLocal()
+        count = db.execute(sa_text(
+            "SELECT COUNT(*) FROM sync_clients WHERE is_active = 1"
+        )).scalar()
+        db.close()
+        return count or 0
+    except:
+        return 0
+
+--- 修改后 ---
+def _active_client_count(username: str = ""):
+    """获取指定用户的活跃客户端数量"""
+    try:
+        db = SessionLocal()
+        if username:
+            count = db.execute(sa_text(
+                "SELECT COUNT(*) FROM sync_clients WHERE is_active = 1 AND username = :username"
+            ), {"username": username}).scalar()
+        else:
+            count = db.execute(sa_text(
+                "SELECT COUNT(*) FROM sync_clients WHERE is_active = 1"
+            )).scalar()
+        db.close()
+        return count or 0
+    except:
+        return 0
+
+
+=====================================
+  修改 4：_record_change() 增加 username 参数
+=====================================
+
+文件：sync_config/__init__.py
+
+--- 修改前 ---
+def _record_change(path: str, action: str, client_id: str = "", is_dir: bool = False, old_path: str = ""):
+    """记录一条文件变更（仅在 >=2 活跃客户端时才记录）"""
+    if _active_client_count() < 2:
+        return
+    try:
+        db = SessionLocal()
+        db.execute(sa_text(
+            "INSERT INTO file_changes (path, action, client_id, is_dir, old_path) "
+            "VALUES (:path, :action, :cid, :is_dir, :old_path)"
+        ), {"path": path, "action": action, "cid": client_id or "",
+            "is_dir": 1 if is_dir else 0, "old_path": old_path or ""})
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"[CHANGES] DB write error: {e}")
+
+--- 修改后 ---
+def _record_change(path: str, action: str, client_id: str = "", is_dir: bool = False, old_path: str = "", username: str = ""):
+    """记录一条文件变更（仅在该用户 >=2 活跃客户端时才记录）"""
+    if _active_client_count(username) < 2:
+        return
+    try:
+        db = SessionLocal()
+        db.execute(sa_text(
+            "INSERT INTO file_changes (path, action, client_id, is_dir, old_path, username) "
+            "VALUES (:path, :action, :cid, :is_dir, :old_path, :username)"
+        ), {"path": path, "action": action, "cid": client_id or "",
+            "is_dir": 1 if is_dir else 0, "old_path": old_path or "",
+            "username": username or ""})
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"[CHANGES] DB write error: {e}")
+
+
+=====================================
+  修改 5：所有调用 _record_change 的地方传入 username
+=====================================
+
+文件：sync_config/__init__.py
+
+每个调用 _record_change 的路由函数都有 user=Depends(get_current_user)，
+在调用时追加 username=user.username（或 user["username"]，取决于 user 的类型）。
+
+示例（以 /upload-stream 为例）：
+
+--- 修改前 ---
+    _record_change(relative_path, "update", client_id, is_dir=False)
+
+--- 修改后 ---
+    _record_change(relative_path, "update", client_id, is_dir=False, username=user.username)
+
+需要修改的所有调用点（在 sync_config/__init__.py 中搜索 _record_change）：
+- /upload-stream 路由中
+- /delete 路由中
+- /mkdir 路由中
+- /rename 路由中
+- /move 路由中
+
+每个都追加 username=user.username 参数。
+
+
+=====================================
+  修改 6：/register-client 路由 - 存储 username
+=====================================
+
+文件：sync_config/__init__.py
+
+--- 修改前 ---
+@router.post("/register-client")
+def register_client(config: dict, user=Depends(get_current_user)):
+    client_id = config.get("client_id", "").strip()
+    hostname = config.get("hostname", "")
+    ip = config.get("ip", "")
+    if not client_id:
+        raise HTTPException(400, "client_id 不能为空")
+    
+    db = SessionLocal()
+    existing = db.execute(sa_text(
+        "SELECT client_id FROM sync_clients WHERE client_id = :cid"
+    ), {"cid": client_id}).fetchone()
+    
+    need_full_sync = False
+    if existing:
+        db.execute(sa_text(
+            "UPDATE sync_clients SET hostname = :h, ip = :ip, is_active = 1, registered_at = :t WHERE client_id = :cid"
+        ), {"h": hostname, "ip": ip, "t": datetime.now().isoformat(), "cid": client_id})
+    else:
+        ...（插入新记录）
+
+--- 修改后 ---
+@router.post("/register-client")
+def register_client(config: dict, user=Depends(get_current_user)):
+    client_id = config.get("client_id", "").strip()
+    hostname = config.get("hostname", "")
+    ip = config.get("ip", "")
+    username = user.username  # 从 Token 中解析出的用户名
+    if not client_id:
+        raise HTTPException(400, "client_id 不能为空")
+    
+    db = SessionLocal()
+    existing = db.execute(sa_text(
+        "SELECT client_id FROM sync_clients WHERE client_id = :cid"
+    ), {"cid": client_id}).fetchone()
+    
+    need_full_sync = False
+    if existing:
+        db.execute(sa_text(
+            "UPDATE sync_clients SET hostname = :h, ip = :ip, is_active = 1, registered_at = :t, username = :u WHERE client_id = :cid"
+        ), {"h": hostname, "ip": ip, "t": datetime.now().isoformat(), "cid": client_id, "u": username})
+    else:
+        # 插入时也加 username
+        db.execute(sa_text(
+            "INSERT INTO sync_clients (client_id, hostname, ip, registered_at, is_active, username) "
+            "VALUES (:cid, :h, :ip, :t, 1, :u)"
+        ), {"cid": client_id, "h": hostname, "ip": ip, "t": datetime.now().isoformat(), "u": username})
+        # 检查该客户端是否有游标记录（之前注册过又被删除）
+        ...（need_full_sync 逻辑不变）
+
+    # client_count 改为只计算该用户的客户端数
+    client_count = _active_client_count(username)
+    db.commit()
+    db.close()
+    return {"message": "已注册", "client_count": client_count, "need_full_sync": need_full_sync}
+
+注意：client_count 用 _active_client_count(username) 替换原来的全局计数。
+
+
+=====================================
+  修改 7：GET /clients 路由 - 按 username 过滤
+=====================================
+
+文件：sync_config/__init__.py
+
+--- 修改前 ---
+@router.get("/clients")
+def list_clients(user=Depends(get_current_user)):
+    db = SessionLocal()
+    rows = db.execute(sa_text(
+        "SELECT client_id, hostname, ip, registered_at FROM sync_clients WHERE is_active = 1 ORDER BY registered_at DESC"
+    )).fetchall()
+    db.close()
+    clients = [{"client_id": r[0], "hostname": r[1], "ip": r[2], "registered_at": r[3]} for r in rows]
+    return {"clients": clients}
+
+--- 修改后 ---
+@router.get("/clients")
+def list_clients(user=Depends(get_current_user)):
+    username = user.username
+    db = SessionLocal()
+    rows = db.execute(sa_text(
+        "SELECT client_id, hostname, ip, registered_at FROM sync_clients "
+        "WHERE is_active = 1 AND username = :username ORDER BY registered_at DESC"
+    ), {"username": username}).fetchall()
+    db.close()
+    clients = [{"client_id": r[0], "hostname": r[1], "ip": r[2], "registered_at": r[3]} for r in rows]
+    return {"clients": clients}
+
+
+=====================================
+  修改 8：POST /remove-client 路由 - 按 username 过滤
+=====================================
+
+文件：sync_config/__init__.py
+
+--- 修改前 ---
+@router.post("/remove-client")
+def remove_client(config: dict, user=Depends(get_current_user)):
+    client_id = config.get("client_id", "").strip()
+    if not client_id:
+        raise HTTPException(400, "client_id 不能为空")
+    
+    db = SessionLocal()
+    db.execute(sa_text(
+        "UPDATE sync_clients SET is_active = 0 WHERE client_id = :cid"
+    ), {"cid": client_id})
+    ...
+
+--- 修改后 ---
+@router.post("/remove-client")
+def remove_client(config: dict, user=Depends(get_current_user)):
+    client_id = config.get("client_id", "").strip()
+    username = user.username
+    if not client_id:
+        raise HTTPException(400, "client_id 不能为空")
+    
+    db = SessionLocal()
+    # 只能删除自己用户的客户端
+    db.execute(sa_text(
+        "UPDATE sync_clients SET is_active = 0 WHERE client_id = :cid AND username = :username"
+    ), {"cid": client_id, "username": username})
+    ...
+
+    # 检查该用户剩余活跃客户端数
+    remaining = _active_client_count(username)
+    if remaining <= 1:
+        # 只清理该用户的 file_changes
+        db.execute(sa_text(
+            "DELETE FROM file_changes WHERE username = :username"
+        ), {"username": username})
+    ...
+
+
+=====================================
+  修改 9：GET /modlist 路由 - 按 username 过滤
+=====================================
+
+文件：sync_config/__init__.py
+
+modlist 查询需要增加 username 条件：
+
+--- 修改前 ---
+            changes = db.execute(sa_text(
+                "SELECT id, path, action, client_id, is_dir, old_path FROM file_changes "
+                "WHERE id > :cursor AND client_id != :cid "
+                "ORDER BY id ASC"
+            ), {"cursor": cursor_id, "cid": client_id}).fetchall()
+
+--- 修改后 ---
+            username = user.username
+            changes = db.execute(sa_text(
+                "SELECT id, path, action, client_id, is_dir, old_path FROM file_changes "
+                "WHERE id > :cursor AND client_id != :cid AND username = :username "
+                "ORDER BY id ASC"
+            ), {"cursor": cursor_id, "cid": client_id, "username": username}).fetchall()
+
+同样修改不带 client_id 的回退查询（如果有的话）。
+
+
+=====================================
+  修改总结
+=====================================
+
+数据库：
+  - sync_clients 加 username TEXT NOT NULL DEFAULT ''
+  - file_changes 加 username TEXT NOT NULL DEFAULT ''
+
+API 变更：
+  - POST /register-client: 从 Token 解析 username 存入 sync_clients
+  - GET /clients: 加 WHERE username = :username
+  - POST /remove-client: 加 AND username = :username
+  - GET /modlist: 加 AND username = :username
+  - _active_client_count(username): 按用户计数
+  - _record_change(..., username): 写入 username
+
+客户端无需大改：
+  - 服务端从 Bearer Token 自动解析 username，客户端不需要额外传
+  - 但客户端 RegisterClientAsync 目前发送的 payload 里没有 username，
+    建议也加上（作为可选的双重验证），与 Token 解析的 username 一致
+
+向后兼容：
+  - 旧客户端连接时，服务端仍从 Token 解析 username
+  - 已有的 sync_clients 记录 username 为空字符串，
+    下次 register-client 时会更新为正确的 username
+  - 已有的 file_changes 记录 username 为空字符串，
+    新的查询 WHERE username = :username 不会匹配到旧记录（安全）
