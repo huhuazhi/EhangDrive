@@ -780,6 +780,36 @@ public sealed class SyncEngine : IDisposable
     }
 
     /// <summary>
+    /// FETCH_DATA 下载完成后调用：设置文件 IN_SYNC + 刷新资源管理器图标 + 刷新父目录状态
+    /// 解决水合完成后蓝色进度条/父目录蓝圈不变绿勾的问题
+    /// </summary>
+    public void SetInSyncAfterHydration(string fullPath)
+    {
+        try
+        {
+            using var handle = OpenFileForCldApi(fullPath);
+            if (handle == null) return;
+
+            int hr = CfSetInSyncState(
+                handle.DangerousGetHandle(),
+                CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                IntPtr.Zero);
+            FileLogger.Log($"  SetInSyncAfterHydration: 0x{hr:X8}");
+
+            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, fullPath);
+
+            // 刷新父目录状态（蓝圈 → 绿勾）
+            MarkParentDirectoriesDirty(fullPath);
+            FlushDirtyDirectories();
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"  SetInSyncAfterHydration 异常: {ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// 以适合 Cloud Filter API 的方式打开文件句柄
     /// 对只读文件会临时去掉只读属性以获取写权限
     /// </summary>

@@ -433,7 +433,7 @@ public sealed class SyncProviderConnection : IDisposable
             CfReportProviderProgress(connectionKey, transferKey, fileSize, requiredOffset);
 
             // ── 流式分块下载 + 逐块 TRANSFER_DATA ──
-            const int CHUNK_SIZE = 1 * 1024 * 1024; // 1MB per chunk，进度更平滑
+            const int CHUNK_SIZE = 4 * 1024 * 1024; // 4MB per chunk
 
             // 用 CancellationTokenSource 在取消时立即中止 HTTP 请求
             // 避免 response.Dispose() 排空未读数据导致长时间阻塞
@@ -536,11 +536,12 @@ public sealed class SyncProviderConnection : IDisposable
                 response?.Dispose();
             }
 
-            // 标记为 ModList 抑制，防止 FETCH_DATA 下载后 FileWatcher 触发重新上传
+            // 标记为 ModList 抑制 + 设置 IN_SYNC + 刷新父目录状态
             if (_syncEngine != null && _syncFolder != null)
             {
                 var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
                 _syncEngine.SuppressForModList(fullPath);
+                _syncEngine.SetInSyncAfterHydration(fullPath);
             }
         }
         catch (Exception ex)
