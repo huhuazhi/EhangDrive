@@ -317,9 +317,10 @@ public sealed class SyncProviderConnection : IDisposable
 
                 if (isDir)
                 {
-                    // 目录：递归释放所有已 hydrated 文件
+                    // 目录：递归释放所有已 hydrated 文件（跳过 PINNED 文件）
                     FileLogger.Log($"DEHYDRATE: UNPINNED 目录检测到，释放空间: {fullPath}");
                     int count = 0;
+                    int skipped = 0;
                     foreach (var file in Directory.GetFiles(fullPath, "*", SearchOption.AllDirectories))
                     {
                         try
@@ -335,6 +336,24 @@ public sealed class SyncProviderConnection : IDisposable
                             if (fh == IntPtr.Zero || fh == new IntPtr(-1)) continue;
                             try
                             {
+                                // 检查文件是否被 PINNED（始终保留在此设备上）
+                                IntPtr fileBuf = Marshal.AllocHGlobal(256);
+                                try
+                                {
+                                    int phr = CfGetPlaceholderInfo(fh, 0, fileBuf, 256, out uint fRetLen);
+                                    if (phr >= 0 && fRetLen >= 4)
+                                    {
+                                        uint filePinState = (uint)Marshal.ReadInt32(fileBuf, 0);
+                                        if (filePinState == 1) // PINNED
+                                        {
+                                            skipped++;
+                                            FileLogger.Log($"  跳过 PINNED 文件: {Path.GetFileName(file)}");
+                                            continue;
+                                        }
+                                    }
+                                }
+                                finally { Marshal.FreeHGlobal(fileBuf); }
+
                                 int dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
                                 if (dhr >= 0) count++;
                                 else FileLogger.Log($"  Dehydrate 失败: 0x{(uint)dhr:X8} {Path.GetFileName(file)}");
@@ -343,7 +362,7 @@ public sealed class SyncProviderConnection : IDisposable
                         }
                         catch { }
                     }
-                    FileLogger.Log($"  已释放空间: {fullPath} ({count}个文件)");
+                    FileLogger.Log($"  已释放空间: {fullPath} ({count}个文件, 跳过{skipped}个PINNED)");
                     _dehydrateCooldown[fullPath] = DateTime.UtcNow.Ticks;
                     return true;
                 }
