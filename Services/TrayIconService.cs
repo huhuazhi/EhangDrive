@@ -141,7 +141,7 @@ public sealed class TrayIconService : IDisposable
     private enum DotColor { None, Green, Orange }
 
     /// <summary>
-    /// 程序化绘制 16×16 托盘图标：蓝色圆角背景 + 白色 "e" + 立体状态圆点
+    /// 程序化绘制 16×16 托盘图标：红色圆角背景 + 白色 "e" + 立体状态圆点
     /// </summary>
     private static Icon CreateTrayIcon(DotColor dotColor)
     {
@@ -154,7 +154,7 @@ public sealed class TrayIconService : IDisposable
             g.CompositingQuality = CompositingQuality.HighQuality;
             g.Clear(Color.Transparent);
 
-            // ── 蓝色圆角方形背景 ──
+            // ── 红色圆角方形背景（EHang品牌红）──
             using var bgPath = new GraphicsPath();
             const float cr = 3.5f;
             bgPath.AddArc(0f, 0f, cr, cr, 180, 90);
@@ -165,8 +165,8 @@ public sealed class TrayIconService : IDisposable
 
             using var bgBrush = new LinearGradientBrush(
                 new Rectangle(0, 0, sz, sz),
-                Color.FromArgb(255, 0, 137, 208),   // #0089D0
-                Color.FromArgb(255, 0, 82, 155),    // #00529B
+                Color.FromArgb(255, 180, 30, 35),   // EHang Red
+                Color.FromArgb(255, 130, 15, 20),   // EHang Dark Red
                 LinearGradientMode.ForwardDiagonal);
             g.FillPath(bgBrush, bgPath);
 
