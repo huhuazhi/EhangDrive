@@ -431,7 +431,7 @@ public sealed class SyncProviderConnection : IDisposable
             CfReportProviderProgress(connectionKey, transferKey, fileSize, requiredOffset);
 
             // ── 流式分块下载 + 逐块 TRANSFER_DATA ──
-            const int CHUNK_SIZE = 8 * 1024 * 1024; // 8MB per chunk
+            const int CHUNK_SIZE = 1 * 1024 * 1024; // 1MB per chunk，进度更平滑
 
             // 用 CancellationTokenSource 在取消时立即中止 HTTP 请求
             // 避免 response.Dispose() 排空未读数据导致长时间阻塞
