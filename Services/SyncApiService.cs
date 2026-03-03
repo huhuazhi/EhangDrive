@@ -262,7 +262,7 @@ public class SyncApiService
     }
 
     /// <summary>
-    /// 下载文件指定范围的字节（FETCH_DATA 回调使用）
+    /// 下载文件指定范围的字节（FETCH_DATA 回调使用）— 仅限小文件（&lt;256MB）
     /// </summary>
     public async Task<byte[]> DownloadFileBytesAsync(string relativePath, long offset, long length)
     {
@@ -284,6 +284,21 @@ public class SyncApiService
             FileLogger.Log($"  DownloadFileBytesAsync 异常: {ex.Message}");
             throw;
         }
+    }
+
+    /// <summary>
+    /// 获取文件下载流（流式读取，支持任意大小）。调用方需 Dispose 返回的 response。
+    /// 传入 CancellationToken 以便在用户取消时立即中止 HTTP 请求（避免排空阻塞）。
+    /// </summary>
+    public async Task<HttpResponseMessage> GetDownloadStreamAsync(string relativePath, long offset, long length, CancellationToken ct = default)
+    {
+        var url = $"{_baseUrl}/download?path={Uri.EscapeDataString(relativePath)}";
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        if (length > 0)
+            request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(offset, offset + length - 1);
+        var resp = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+        resp.EnsureSuccessStatusCode();
+        return resp;
     }
 
     /// <summary>

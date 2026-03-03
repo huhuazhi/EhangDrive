@@ -394,7 +394,9 @@ public sealed class SyncProviderConnection : IDisposable
 
     /// <summary>
     /// FETCH_DATA 回调 — Windows 尝试下载文件内容时调用。
-    /// 从服务端下载数据，通过 CfExecute + TRANSFER_DATA 回传给系统。
+    /// 使用流式分块下载，每块 8MB，逐块通过 CfExecute + TRANSFER_DATA 回传给系统。
+    /// 这样任意大小的文件都能处理，内存占用恒定 ~8MB。
+    /// 用户取消时通过 CancellationToken 立即中止 HTTP 请求，避免排空阻塞。
     /// </summary>
     private static void OnFetchData(IntPtr callbackInfoPtr, IntPtr callbackParamsPtr)
     {
@@ -418,67 +420,111 @@ public sealed class SyncProviderConnection : IDisposable
             string relativePath = GetRelativePath(normalizedPath);
             FileLogger.Log($"  relativePath=\"{relativePath}\"");
 
-            // 报告下载开始
-            CfReportProviderProgress(connectionKey, transferKey, fileSize, 0);
-
-            // 从服务端下载文件数据
-            byte[] data;
-            try
-            {
-                data = Task.Run(() => _api!.DownloadFileBytesAsync(relativePath, requiredOffset, requiredLength))
-                    .GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                FileLogger.Log($"  下载失败: {ex.Message}");
-                TransferDataFailure(connectionKey, transferKey);
-                return;
-            }
-
-            FileLogger.Log($"  下载完成: {data.Length} bytes");
-
-            // 报告下载完成
-            CfReportProviderProgress(connectionKey, transferKey, fileSize, requiredOffset + data.Length);
-
-            // 在 CfExecute 写入数据之前就标记抑制，防止 Changed 事件竞态
+            // 在写入数据之前就标记抑制，防止 Changed 事件竞态
             if (_syncEngine != null && _syncFolder != null)
             {
                 var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
                 _syncEngine.MarkRecentlySynced(fullPath);
             }
 
-            // 通过 CfExecute + TRANSFER_DATA 将数据传给 Windows
-            var pinnedData = GCHandle.Alloc(data, GCHandleType.Pinned);
+            // 报告下载开始
+            CfReportProviderProgress(connectionKey, transferKey, fileSize, requiredOffset);
+
+            // ── 流式分块下载 + 逐块 TRANSFER_DATA ──
+            const int CHUNK_SIZE = 8 * 1024 * 1024; // 8MB per chunk
+
+            // 用 CancellationTokenSource 在取消时立即中止 HTTP 请求
+            // 避免 response.Dispose() 排空未读数据导致长时间阻塞
+            using var cts = new CancellationTokenSource();
+            System.Net.Http.HttpResponseMessage? response = null;
             try
             {
-                var opInfo = new CF_OPERATION_INFO
-                {
-                    StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
-                    Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
-                    ConnectionKey = connectionKey,
-                    TransferKey = transferKey,
-                    SyncStatus = IntPtr.Zero,
-                    RequestKey = requestKey,
-                };
+                response = Task.Run(() => _api!.GetDownloadStreamAsync(relativePath, requiredOffset, requiredLength, cts.Token))
+                    .GetAwaiter().GetResult();
 
-                var opParams = new CF_OPERATION_PARAMETERS_TRANSFERDATA
-                {
-                    ParamSize = (uint)Marshal.SizeOf<CF_OPERATION_PARAMETERS_TRANSFERDATA>(),
-                    CompletionStatus = 0,  // STATUS_SUCCESS
-                    Buffer = pinnedData.AddrOfPinnedObject(),
-                    Offset = requiredOffset,
-                    Length = data.Length,
-                };
+                using var stream = Task.Run(() => response.Content.ReadAsStreamAsync(cts.Token)).GetAwaiter().GetResult();
 
-                int hr = CfExecute(in opInfo, ref opParams);
-                FileLogger.Log($"  CfExecute(TRANSFER_DATA) → 0x{hr:X8}");
+                byte[] buffer = new byte[CHUNK_SIZE];
+                long currentOffset = requiredOffset;
+                long totalRead = 0;
+
+                while (totalRead < requiredLength)
+                {
+                    // 从流中读满一个 chunk（或到流末尾）
+                    int wantBytes = (int)Math.Min(CHUNK_SIZE, requiredLength - totalRead);
+                    int bytesInChunk = 0;
+                    while (bytesInChunk < wantBytes)
+                    {
+                        int n = Task.Run(() => stream.ReadAsync(buffer, bytesInChunk, wantBytes - bytesInChunk, cts.Token))
+                            .GetAwaiter().GetResult();
+                        if (n == 0) break; // 流结束
+                        bytesInChunk += n;
+                    }
+
+                    if (bytesInChunk == 0) break; // 无更多数据
+
+                    // 通过 CfExecute + TRANSFER_DATA 将这一块传给 Windows
+                    var pinnedData = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+                    try
+                    {
+                        var opInfo = new CF_OPERATION_INFO
+                        {
+                            StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
+                            Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
+                            ConnectionKey = connectionKey,
+                            TransferKey = transferKey,
+                            SyncStatus = IntPtr.Zero,
+                            RequestKey = requestKey,
+                        };
+
+                        var opParams = new CF_OPERATION_PARAMETERS_TRANSFERDATA
+                        {
+                            ParamSize = (uint)Marshal.SizeOf<CF_OPERATION_PARAMETERS_TRANSFERDATA>(),
+                            CompletionStatus = 0,  // STATUS_SUCCESS
+                            Buffer = pinnedData.AddrOfPinnedObject(),
+                            Offset = currentOffset,
+                            Length = bytesInChunk,
+                        };
+
+                        int hr = CfExecute(in opInfo, ref opParams);
+                        if (hr < 0)
+                        {
+                            FileLogger.Log($"  CfExecute(TRANSFER_DATA) 取消/失败: 0x{(uint)hr:X8} at offset={currentOffset}, 已传输 {totalRead} bytes");
+                            // 立即取消 HTTP 请求，避免 response.Dispose() 排空剩余数据阻塞回调线程
+                            cts.Cancel();
+                            return;
+                        }
+                    }
+                    finally
+                    {
+                        pinnedData.Free();
+                    }
+
+                    currentOffset += bytesInChunk;
+                    totalRead += bytesInChunk;
+
+                    // 更新进度
+                    CfReportProviderProgress(connectionKey, transferKey, fileSize, currentOffset);
+                }
+
+                FileLogger.Log($"  已下载: {relativePath} ({totalRead} bytes, {(totalRead + CHUNK_SIZE - 1) / CHUNK_SIZE} chunks)");
+            }
+            catch (OperationCanceledException)
+            {
+                FileLogger.Log($"  下载已取消: {relativePath}");
+                return;
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log($"  流式下载失败: {ex.Message}");
+                cts.Cancel(); // 确保 HTTP 请求被中止
+                TransferDataFailure(connectionKey, transferKey);
+                return;
             }
             finally
             {
-                pinnedData.Free();
+                response?.Dispose();
             }
-
-            FileLogger.Log($"  已下载: {relativePath} ({data.Length} bytes)");
 
             // 标记为 ModList 抑制，防止 FETCH_DATA 下载后 FileWatcher 触发重新上传
             if (_syncEngine != null && _syncFolder != null)
