@@ -421,10 +421,12 @@ public sealed class SyncProviderConnection : IDisposable
             FileLogger.Log($"  relativePath=\"{relativePath}\"");
 
             // 在写入数据之前就标记抑制，防止 Changed 事件竞态
+            // 同时设置 SuppressForModList，因为大文件下载可能超过 MarkRecentlySynced 的 2 秒窗口
             if (_syncEngine != null && _syncFolder != null)
             {
                 var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
                 _syncEngine.MarkRecentlySynced(fullPath);
+                _syncEngine.SuppressForModList(fullPath);
             }
 
             // 报告下载开始
@@ -508,6 +510,14 @@ public sealed class SyncProviderConnection : IDisposable
                 }
 
                 FileLogger.Log($"  已下载: {relativePath} ({totalRead} bytes, {(totalRead + CHUNK_SIZE - 1) / CHUNK_SIZE} chunks)");
+
+                // 下载完成后立即刷新抑制窗口，防止最后一个 chunk 触发的 Changed 事件竞态
+                if (_syncEngine != null && _syncFolder != null)
+                {
+                    var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
+                    _syncEngine.MarkRecentlySynced(fullPath);
+                    _syncEngine.SuppressForModList(fullPath);
+                }
             }
             catch (OperationCanceledException)
             {
