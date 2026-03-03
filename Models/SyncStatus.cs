@@ -24,10 +24,13 @@ public class TransferItem : INotifyPropertyChanged
     public TransferDirection Direction
     {
         get => _direction;
-        set { _direction = value; OnPropertyChanged(); OnPropertyChanged(nameof(DirectionText)); }
+        set { _direction = value; OnPropertyChanged(); OnPropertyChanged(nameof(DirectionText)); OnPropertyChanged(nameof(DirectionColor)); }
     }
 
     public string DirectionText => Direction == TransferDirection.Upload ? "↑ 上传" : "↓ 下载";
+
+    /// <summary>方向标签颜色：上传红色、下载蓝色</summary>
+    public string DirectionColor => Direction == TransferDirection.Upload ? "#E74C3C" : "#1A73E8";
 
     /// <summary>0~100</summary>
     public double Progress
@@ -50,12 +53,14 @@ public class TransferItem : INotifyPropertyChanged
         set { _status = value; OnPropertyChanged(); OnPropertyChanged(nameof(StatusText)); OnPropertyChanged(nameof(StatusColor)); }
     }
 
-    /// <summary>进度条颜色：传输中蓝色、已完成绿色、失败红色</summary>
-    public string StatusColor => Status switch
+    /// <summary>进度条/状态颜色：上传用红+橘、下载用蓝+绿，失败统一灰色</summary>
+    public string StatusColor => (Direction, Status) switch
     {
-        TransferStatus.Completed => "#27AE60",
-        TransferStatus.Failed => "#E74C3C",
-        _ => "#1A73E8"
+        (_, TransferStatus.Failed) => "#999999",
+        (TransferDirection.Upload, TransferStatus.Completed) => "#E67E22",  // 橘色
+        (TransferDirection.Upload, _) => "#E74C3C",                        // 红色
+        (TransferDirection.Download, TransferStatus.Completed) => "#27AE60",// 绿色
+        (TransferDirection.Download, _) => "#1A73E8",                      // 蓝色
     };
 
     public string StatusText => Status switch

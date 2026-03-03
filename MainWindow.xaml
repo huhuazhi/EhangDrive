@@ -64,7 +64,7 @@
                                                 <ColumnDefinition Width="70"/>
                                             </Grid.ColumnDefinitions>
                                             <TextBlock Grid.Column="0" Text="{Binding DirectionText}"
-                                                       FontSize="12" Foreground="#1A73E8"
+                                                       FontSize="12" Foreground="{Binding DirectionColor}"
                                                        VerticalAlignment="Center" Width="48"/>
                                             <StackPanel Grid.Column="1" Margin="6,0">
                                                 <TextBlock Text="{Binding FileName}" FontSize="12"
