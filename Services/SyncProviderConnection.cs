@@ -1,6 +1,7 @@
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using EhangNAS_Sync.Models;
 using EhangNAS_Sync.Native;
 using static EhangNAS_Sync.Native.CldApi;
 
@@ -431,6 +432,7 @@ public sealed class SyncProviderConnection : IDisposable
 
             // 报告下载开始
             CfReportProviderProgress(connectionKey, transferKey, fileSize, requiredOffset);
+            SyncStatusManager.Instance.AddLog("⬇️", $"水合下载: {relativePath} ({FormatSize(requiredLength)})");
 
             // ── 流式分块下载 + 逐块 TRANSFER_DATA ──
             const int CHUNK_SIZE = 4 * 1024 * 1024; // 4MB per chunk
@@ -510,6 +512,7 @@ public sealed class SyncProviderConnection : IDisposable
                 }
 
                 FileLogger.Log($"  已下载: {relativePath} ({totalRead} bytes, {(totalRead + CHUNK_SIZE - 1) / CHUNK_SIZE} chunks)");
+                SyncStatusManager.Instance.AddLog("✅", $"已水合: {relativePath} ({FormatSize(totalRead)})");
 
                 // 下载完成后立即刷新抑制窗口，防止最后一个 chunk 触发的 Changed 事件竞态
                 if (_syncEngine != null && _syncFolder != null)
@@ -522,11 +525,13 @@ public sealed class SyncProviderConnection : IDisposable
             catch (OperationCanceledException)
             {
                 FileLogger.Log($"  下载已取消: {relativePath}");
+                SyncStatusManager.Instance.AddLog("❌", $"下载已取消: {relativePath}");
                 return;
             }
             catch (Exception ex)
             {
                 FileLogger.Log($"  流式下载失败: {ex.Message}");
+                SyncStatusManager.Instance.AddLog("❌", $"下载失败: {relativePath}");
                 cts.Cancel(); // 确保 HTTP 请求被中止
                 TransferDataFailure(connectionKey, transferKey);
                 return;
@@ -659,5 +664,16 @@ public sealed class SyncProviderConnection : IDisposable
     public void Dispose()
     {
         Disconnect();
+    }
+
+    /// <summary>
+    /// 将字节数格式化为人类可读的大小字符串
+    /// </summary>
+    private static string FormatSize(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
+        if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024):F1} MB";
+        return $"{bytes / (1024.0 * 1024 * 1024):F2} GB";
     }
 }
