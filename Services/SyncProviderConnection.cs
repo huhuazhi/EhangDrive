@@ -33,17 +33,6 @@ public sealed class SyncProviderConnection : IDisposable
     /// </summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _dehydrateCooldown = new(StringComparer.OrdinalIgnoreCase);
 
-    // ERROR_MORE_DATA: CfGetPlaceholderInfo 缓冲区不够装完整结构（含可变长 FileName），
-    // 但前面的固定字段（PinState 等）已成功写入，可以安全读取。
-    private const int HRESULT_ERROR_MORE_DATA = unchecked((int)0x800700EA);
-
-    /// <summary>
-    /// 判断 CfGetPlaceholderInfo 是否成功读取了 PinState（offset 0, 4 bytes）。
-    /// ERROR_MORE_DATA 说明缓冲区不够装完整结构但 PinState 已写入。
-    /// </summary>
-    private static bool IsPinStateReadable(int hr, uint retLen)
-        => (hr >= 0 || hr == HRESULT_ERROR_MORE_DATA) && retLen >= 4;
-
     /// <summary>
     /// 连接到已注册的同步根目录
     /// </summary>
@@ -212,17 +201,7 @@ public sealed class SyncProviderConnection : IDisposable
                 FileLogger.Log($"  CfExecute 调用: StructSize={opInfo.StructSize}, ParamSize={opParams.ParamSize}, count={items.Count}");
                 int hr = CfExecute(in opInfo, ref opParams);
                 FileLogger.Log($"  CfExecute(TRANSFER_PLACEHOLDERS) → 0x{hr:X8}, processed={opParams.EntriesProcessed}");
-                // FETCH_PLACEHOLDERS 刷新会触发 Changed 事件，抑制 10 秒防止假上传
-                if (hr >= 0 && _syncEngine != null && _syncFolder != null)
-                {
-                    foreach (var item in items)
-                    {
-                        var itemFullPath = Path.Combine(_syncFolder,
-                            string.IsNullOrEmpty(relativePath) ? item.Name :
-                            Path.Combine(relativePath.Replace('/', '\\'), item.Name));
-                        _syncEngine.MarkRecentlySynced(itemFullPath, 10);
-                    }
-                }
+
                 // ── 创建子占位符会清除父目录的 IN_SYNC 状态（白云），需要重新设回 ──
                 if (hr >= 0 && items.Count > 0 && !string.IsNullOrEmpty(relativePath))
                 {
@@ -312,11 +291,11 @@ public sealed class SyncProviderConnection : IDisposable
 
             IntPtr handle = CreateFileW(
                 fullPath,
-                0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES (CfDehydratePlaceholder 需要写权限)
+                0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
                 0x00000007, // FILE_SHARE_READ | WRITE | DELETE
                 IntPtr.Zero,
                 3,          // OPEN_EXISTING
-                0x02100000, // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL
+                0x02000000, // FILE_FLAG_BACKUP_SEMANTICS
                 IntPtr.Zero);
 
             if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
@@ -326,10 +305,10 @@ public sealed class SyncProviderConnection : IDisposable
                 IntPtr buf = Marshal.AllocHGlobal(256);
                 try
                 {
-                    // InfoClass = 1 → CF_PLACEHOLDER_INFO_BASIC
+                    // InfoClass = 0 → CF_PLACEHOLDER_INFO_STANDARD
                     // 第一个 DWORD = PinState; UNPINNED = 2
-                    int hr = CfGetPlaceholderInfo(handle, 1, buf, 256, out uint retLen);
-                    if (!IsPinStateReadable(hr, retLen)) return false;
+                    int hr = CfGetPlaceholderInfo(handle, 0, buf, 256, out uint retLen);
+                    if (hr < 0 || retLen < 8) return false;
 
                     uint pinState = (uint)Marshal.ReadInt32(buf, 0);
                     if (pinState != 2) return false; // 不是 UNPINNED
@@ -338,10 +317,9 @@ public sealed class SyncProviderConnection : IDisposable
 
                 if (isDir)
                 {
-                    // 目录：递归释放所有已 hydrated 文件（跳过 PINNED 文件）
+                    // 目录：递归释放所有已 hydrated 文件
                     FileLogger.Log($"DEHYDRATE: UNPINNED 目录检测到，释放空间: {fullPath}");
                     int count = 0;
-                    int skipped = 0;
                     foreach (var file in Directory.GetFiles(fullPath, "*", SearchOption.AllDirectories))
                     {
                         try
@@ -353,28 +331,10 @@ public sealed class SyncProviderConnection : IDisposable
                             var fh = CreateFileW(file,
                                 0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
                                 0x00000007,
-                                IntPtr.Zero, 3, 0x02100000, IntPtr.Zero);
+                                IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
                             if (fh == IntPtr.Zero || fh == new IntPtr(-1)) continue;
                             try
                             {
-                                // 检查文件是否被 PINNED（始终保留在此设备上）
-                                IntPtr fileBuf = Marshal.AllocHGlobal(64);
-                                try
-                                {
-                                    int phr = CfGetPlaceholderInfo(fh, 1, fileBuf, 64, out uint fRetLen);
-                                    if (IsPinStateReadable(phr, fRetLen))
-                                    {
-                                        uint filePinState = (uint)Marshal.ReadInt32(fileBuf, 0);
-                                        if (filePinState == 1) // PINNED
-                                        {
-                                            skipped++;
-                                            FileLogger.Log($"  跳过 PINNED 文件: {Path.GetFileName(file)}");
-                                            continue;
-                                        }
-                                    }
-                                }
-                                finally { Marshal.FreeHGlobal(fileBuf); }
-
                                 int dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
                                 if (dhr >= 0) count++;
                                 else FileLogger.Log($"  Dehydrate 失败: 0x{(uint)dhr:X8} {Path.GetFileName(file)}");
@@ -383,7 +343,7 @@ public sealed class SyncProviderConnection : IDisposable
                         }
                         catch { }
                     }
-                    FileLogger.Log($"  已释放空间: {fullPath} ({count}个文件, 跳过{skipped}个PINNED)");
+                    FileLogger.Log($"  已释放空间: {fullPath} ({count}个文件)");
                     _dehydrateCooldown[fullPath] = DateTime.UtcNow.Ticks;
                     return true;
                 }
@@ -419,10 +379,10 @@ public sealed class SyncProviderConnection : IDisposable
     }
 
     /// <summary>
-    /// 检测"始终保留在此设备上"请求（PinState = PINNED）。
-    /// 用户右键选择后，Windows 将 PinState 设为 PINNED 并自动触发 FETCH_DATA 回调完成水合。
-    /// 此方法仅检测 PINNED 状态并返回 true，防止 Changed 事件被误处理为文件修改。
-    /// 不需要手动调用 CfHydratePlaceholder —— Windows 自身会处理水合。
+    /// 检测并处理"始终保留在此设备上"请求。
+    /// 用户右键选择后，Windows 将 PinState 设为 PINNED。
+    /// 检测到后主动调用 CfHydratePlaceholder 水合本地占位符。
+    /// CfHydratePlaceholder 会内部触发 FETCH_DATA 回调完成实际下载。
     /// </summary>
     public static bool TryHandlePinRequest(string fullPath)
     {
@@ -432,39 +392,91 @@ public sealed class SyncProviderConnection : IDisposable
             bool isFile = !isDir && File.Exists(fullPath);
             if (!isDir && !isFile) return false;
 
+            // 冷却检查：同一路径 60 秒内不重复水合
+            var nowTicks = DateTime.UtcNow.Ticks;
+            if (_dehydrateCooldown.TryGetValue("PIN:" + fullPath, out var lastTicks))
+            {
+                if ((nowTicks - lastTicks) < TimeSpan.TicksPerSecond * 60)
+                    return true;
+            }
+
             IntPtr handle = CreateFileW(
                 fullPath,
-                0x00000080, // FILE_READ_ATTRIBUTES
+                0x00000181, // FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
                 0x00000007, // FILE_SHARE_READ | WRITE | DELETE
                 IntPtr.Zero,
                 3,          // OPEN_EXISTING
-                0x02100000, // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL
+                0x02000000, // FILE_FLAG_BACKUP_SEMANTICS
                 IntPtr.Zero);
 
-            if (handle == IntPtr.Zero || handle == new IntPtr(-1))
-            {
-                FileLogger.Log($"TryHandlePinRequest: CreateFileW 失败, err={Marshal.GetLastWin32Error()}: {fullPath}");
-                return false;
-            }
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
 
             try
             {
-                IntPtr buf = Marshal.AllocHGlobal(64);
+                IntPtr buf = Marshal.AllocHGlobal(256);
                 try
                 {
-                    // InfoClass = 1 → CF_PLACEHOLDER_INFO_BASIC，PinState 在偏移 0
-                    int hr = CfGetPlaceholderInfo(handle, 1, buf, 64, out uint retLen);
-                    if (!IsPinStateReadable(hr, retLen)) return false;
+                    int hr = CfGetPlaceholderInfo(handle, 0, buf, 256, out uint retLen);
+                    if (hr < 0 || retLen < 8) return false;
 
                     uint pinState = (uint)Marshal.ReadInt32(buf, 0);
                     if (pinState != 1) return false; // 不是 PINNED
                 }
                 finally { Marshal.FreeHGlobal(buf); }
 
-                // 检测到 PINNED，记录日志并返回 true
-                // Windows 会自动触发 FETCH_DATA 完成水合，我们只需不干扰
-                FileLogger.Log($"HYDRATE: PINNED 文件检测到，始终保留: {fullPath}");
-                return true;
+                if (isDir)
+                {
+                    // 目录：递归水合所有 dehydrated 文件
+                    FileLogger.Log($"HYDRATE: PINNED 目录检测到，始终保留: {fullPath}");
+                    int count = 0;
+                    foreach (var file in Directory.GetFiles(fullPath, "*", SearchOption.AllDirectories))
+                    {
+                        try
+                        {
+                            var fi = new FileInfo(file);
+                            if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
+                            if (!fi.Attributes.HasFlag(FileAttributes.Offline)) continue; // 已 hydrated，跳过
+
+                            var fh = CreateFileW(file,
+                                0x00000181, // FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+                                0x00000007,
+                                IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+                            if (fh == IntPtr.Zero || fh == new IntPtr(-1)) continue;
+                            try
+                            {
+                                int hhr = CfHydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
+                                if (hhr >= 0) count++;
+                                else FileLogger.Log($"  Hydrate 失败: 0x{(uint)hhr:X8} {Path.GetFileName(file)}");
+                            }
+                            finally { CloseHandle(fh); }
+                        }
+                        catch { }
+                    }
+                    FileLogger.Log($"  已水合: {fullPath} ({count}个文件)");
+                    _dehydrateCooldown["PIN:" + fullPath] = DateTime.UtcNow.Ticks;
+                    return true;
+                }
+                else
+                {
+                    // 单个文件
+                    var fi = new FileInfo(fullPath);
+                    if (!fi.Attributes.HasFlag(FileAttributes.Offline)) return true; // 已 hydrated
+                    if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) return false; // 不是 placeholder
+
+                    FileLogger.Log($"HYDRATE: PINNED 文件检测到，始终保留: {fullPath}");
+                    int hhr = CfHydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
+                    if (hhr >= 0)
+                    {
+                        FileLogger.Log($"  已水合: {fullPath}");
+                        _dehydrateCooldown["PIN:" + fullPath] = DateTime.UtcNow.Ticks;
+                        return true;
+                    }
+                    else
+                    {
+                        FileLogger.Log($"  Hydrate 失败: 0x{(uint)hhr:X8} {fullPath}");
+                        return false;
+                    }
+                }
             }
             finally { CloseHandle(handle); }
         }
@@ -473,38 +485,6 @@ public sealed class SyncProviderConnection : IDisposable
             FileLogger.Log($"TryHandlePinRequest 异常: {ex.Message}");
             return false;
         }
-    }
-
-    /// <summary>
-    /// 读取文件的 PinState（供 HandleModifyFile 安全检查用）。
-    /// 返回: 0=Unspecified, 1=PINNED, 2=UNPINNED, -1=失败
-    /// </summary>
-    public static int ReadPinState(string fullPath)
-    {
-        try
-        {
-            IntPtr handle = CreateFileW(
-                fullPath,
-                0x00000080, // FILE_READ_ATTRIBUTES
-                0x00000007,
-                IntPtr.Zero, 3,
-                0x02100000, // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL
-                IntPtr.Zero);
-            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return -1;
-            try
-            {
-                IntPtr buf = Marshal.AllocHGlobal(64);
-                try
-                {
-                    int hr = CfGetPlaceholderInfo(handle, 1, buf, 64, out uint retLen);
-                    if (!IsPinStateReadable(hr, retLen)) return -1;
-                    return Marshal.ReadInt32(buf, 0);
-                }
-                finally { Marshal.FreeHGlobal(buf); }
-            }
-            finally { CloseHandle(handle); }
-        }
-        catch { return -1; }
     }
 
     /// <summary>
@@ -711,16 +691,12 @@ public sealed class SyncProviderConnection : IDisposable
                 response?.Dispose();
             }
 
-            // 标记为 ModList 抑制 + 设置 IN_SYNC + 刷新父目录状态 + 记录 mtime防止假上传
+            // 标记为 ModList 抑制 + 设置 IN_SYNC + 刷新父目录状态
             if (_syncEngine != null && _syncFolder != null)
             {
                 var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
                 _syncEngine.SuppressForModList(fullPath);
                 _syncEngine.SetInSyncAfterHydration(fullPath);
-                // 记录水合文件的 mtime，防止后续 Changed 事件触发假上传
-                _syncEngine.RecordHydratedFileMtime(fullPath, relativePath);
-                // 延长 RecentlySynced 窗口，防止水合后 10+ 秒的属性变更触发上传
-                _syncEngine.MarkRecentlySynced(fullPath, 15);
             }
 
             } // end try (EndBusy)
@@ -749,42 +725,10 @@ public sealed class SyncProviderConnection : IDisposable
             IntPtr correlationVector = CallbackInfoReader.GetCorrelationVector(callbackInfoPtr);
             string normalizedPath = CallbackInfoReader.GetNormalizedPathString(callbackInfoPtr);
             string relativePath = GetRelativePath(normalizedPath);
-            string fullPath = normalizedPath.StartsWith(@"\\?\") ? normalizedPath.Substring(4) : normalizedPath;
 
             FileLogger.Log($"NOTIFY_DEHYDRATE: {relativePath}");
 
-            // 检查文件是否 PINNED（始终保留在此设备上），如果是则拒绝脱水
-            int completionStatus = 0; // 默认: 允许脱水
-            try
-            {
-                IntPtr fh = CreateFileW(fullPath,
-                    0x00000080, 0x00000007, IntPtr.Zero, 3, 0x02100000, IntPtr.Zero);
-                if (fh != IntPtr.Zero && fh != new IntPtr(-1))
-                {
-                    try
-                    {
-                        IntPtr buf = Marshal.AllocHGlobal(64);
-                        try
-                        {
-                            int phr = CfGetPlaceholderInfo(fh, 1, buf, 64, out uint retLen);
-                            if (IsPinStateReadable(phr, retLen))
-                            {
-                                uint pinState = (uint)Marshal.ReadInt32(buf, 0);
-                                if (pinState == 1) // PINNED
-                                {
-                                    FileLogger.Log($"  拒绝脱水(文件为PINNED): {relativePath}");
-                                    completionStatus = unchecked((int)0xC0000022); // STATUS_ACCESS_DENIED
-                                }
-                            }
-                        }
-                        finally { Marshal.FreeHGlobal(buf); }
-                    }
-                    finally { CloseHandle(fh); }
-                }
-            }
-            catch { }
-
-            // ACK/NACK dehydrate
+            // ACK 同意 dehydrate
             var opInfo = new CF_OPERATION_INFO
             {
                 StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
@@ -800,17 +744,20 @@ public sealed class SyncProviderConnection : IDisposable
             {
                 ParamSize = (uint)Marshal.SizeOf<CF_OPERATION_PARAMETERS_ACKDEHYDRATE>(),
                 Flags = 0,
-                CompletionStatus = completionStatus,
+                CompletionStatus = 0, // STATUS_SUCCESS
                 FileIdentity = IntPtr.Zero,
                 FileIdentityLength = 0,
             };
 
             int hr = CfExecute(in opInfo, ref opParams);
-            FileLogger.Log($"  ACK_DEHYDRATE → 0x{hr:X8} (status={completionStatus})");
+            FileLogger.Log($"  ACK_DEHYDRATE → 0x{hr:X8}");
 
-            if (hr >= 0 && completionStatus == 0)
+            if (hr >= 0)
             {
                 // ACK 成功后，延迟恢复 IN_SYNC 状态
+                // Windows 执行 dehydrate 需要一点时间，之后会发 DEHYDRATE_COMPLETION
+                // 这里做延迟恢复作为双保险
+                string fullPath = normalizedPath.StartsWith(@"\\?\") ? normalizedPath.Substring(4) : normalizedPath;
                 _ = Task.Run(async () =>
                 {
                     try
