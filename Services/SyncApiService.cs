@@ -349,6 +349,11 @@ public class SyncApiService
             FileLogger.Log($"  HTTP {(int)resp.StatusCode}: {body}");
             return resp.IsSuccessStatusCode;
         }
+        catch (IOException)
+        {
+            // 文件被占用（正在拷贝中），抛出让调用方单独处理
+            throw;
+        }
         catch (Exception ex)
         {
             FileLogger.Log($"  UploadFileAsync 异常: {ex.Message}");

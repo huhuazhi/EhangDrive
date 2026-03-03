@@ -551,8 +551,25 @@ public sealed class SyncEngine : IDisposable
         {
             SyncStatusManager.Instance.AddLog("↑", $"上传: {relativePath}");
 
-            for (int attempt = 1; attempt <= 5; attempt++)
+            // 分离两类重试：
+            // - 文件被占用（IOException）：文件正在拷贝中，最多等 3 分钟，不计入上传重试次数
+            // - 上传失败（服务器错误/网络问题）：最多重试 5 次
+            int uploadAttempt = 0;
+            var retryStart = DateTime.UtcNow;
+
+            while (true)
             {
+                // 文件占用超时：最多等 3 分钟
+                if ((DateTime.UtcNow - retryStart).TotalMinutes > 3)
+                {
+                    FileLogger.Log($"  等待文件可读超时(3分钟)，放弃: {relativePath}");
+                    break;
+                }
+
+                // 上传失败超过 5 次则放弃
+                if (uploadAttempt >= 5)
+                    break;
+
                 // 再次检查文件是否存在
                 if (!File.Exists(fullPath))
                 {
@@ -605,16 +622,22 @@ public sealed class SyncEngine : IDisposable
                         SyncStatusManager.Instance.AddLog("✅", $"已上传: {relativePath}");
                         return;
                     }
-                    else if (attempt < 5)
+                    else
                     {
-                        FileLogger.Log($"  上传失败，{attempt * 3}秒后重试({attempt}/5): {relativePath}");
-                        await Task.Delay(attempt * 3000);
+                        uploadAttempt++;
+                        if (uploadAttempt < 5)
+                        {
+                            var delay = uploadAttempt * 3;
+                            FileLogger.Log($"  上传失败，{delay}秒后重试({uploadAttempt}/5): {relativePath}");
+                            await Task.Delay(delay * 1000);
+                        }
                     }
                 }
-                catch (IOException) when (attempt < 5)
+                catch (IOException)
                 {
-                    FileLogger.Log($"  文件被占用，{attempt * 3}秒后重试({attempt}/5): {relativePath}");
-                    await Task.Delay(attempt * 3000);
+                    // 文件被占用（正在拷贝中），不计入上传重试次数，每 3 秒重试
+                    FileLogger.Log($"  文件被占用(可能正在拷贝)，3秒后重试: {relativePath}");
+                    await Task.Delay(3000);
                 }
                 catch (Exception ex)
                 {
@@ -624,7 +647,7 @@ public sealed class SyncEngine : IDisposable
             }
 
             // 上传失败
-            FileLogger.Log($"  上传最终失败(5次重试均失败): {relativePath}");
+            FileLogger.Log($"  上传最终失败: {relativePath}");
             transferItem.Status = TransferStatus.Failed;
             SyncStatusManager.Instance.AddLog("❌", $"上传失败: {relativePath}");
         }
