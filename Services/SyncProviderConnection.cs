@@ -201,7 +201,17 @@ public sealed class SyncProviderConnection : IDisposable
                 FileLogger.Log($"  CfExecute 调用: StructSize={opInfo.StructSize}, ParamSize={opParams.ParamSize}, count={items.Count}");
                 int hr = CfExecute(in opInfo, ref opParams);
                 FileLogger.Log($"  CfExecute(TRANSFER_PLACEHOLDERS) → 0x{hr:X8}, processed={opParams.EntriesProcessed}");
-
+                // FETCH_PLACEHOLDERS 刷新会触发 Changed 事件，抑制 10 秒防止假上传
+                if (hr >= 0 && _syncEngine != null && _syncFolder != null)
+                {
+                    foreach (var item in items)
+                    {
+                        var itemFullPath = Path.Combine(_syncFolder,
+                            string.IsNullOrEmpty(relativePath) ? item.Name :
+                            Path.Combine(relativePath.Replace('/', '\\'), item.Name));
+                        _syncEngine.MarkRecentlySynced(itemFullPath, 10);
+                    }
+                }
                 // ── 创建子占位符会清除父目录的 IN_SYNC 状态（白云），需要重新设回 ──
                 if (hr >= 0 && items.Count > 0 && !string.IsNullOrEmpty(relativePath))
                 {
@@ -291,11 +301,11 @@ public sealed class SyncProviderConnection : IDisposable
 
             IntPtr handle = CreateFileW(
                 fullPath,
-                0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+                0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES (CfDehydratePlaceholder 需要写权限)
                 0x00000007, // FILE_SHARE_READ | WRITE | DELETE
                 IntPtr.Zero,
                 3,          // OPEN_EXISTING
-                0x02000000, // FILE_FLAG_BACKUP_SEMANTICS
+                0x02100000, // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL
                 IntPtr.Zero);
 
             if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
@@ -332,7 +342,7 @@ public sealed class SyncProviderConnection : IDisposable
                             var fh = CreateFileW(file,
                                 0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
                                 0x00000007,
-                                IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+                                IntPtr.Zero, 3, 0x02100000, IntPtr.Zero);
                             if (fh == IntPtr.Zero || fh == new IntPtr(-1)) continue;
                             try
                             {
@@ -413,14 +423,18 @@ public sealed class SyncProviderConnection : IDisposable
 
             IntPtr handle = CreateFileW(
                 fullPath,
-                0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+                0x00000080, // FILE_READ_ATTRIBUTES
                 0x00000007, // FILE_SHARE_READ | WRITE | DELETE
                 IntPtr.Zero,
                 3,          // OPEN_EXISTING
-                0x02000000, // FILE_FLAG_BACKUP_SEMANTICS
+                0x02100000, // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL
                 IntPtr.Zero);
 
-            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+            {
+                FileLogger.Log($"TryHandlePinRequest: CreateFileW 失败, err={Marshal.GetLastWin32Error()}: {fullPath}");
+                return false;
+            }
 
             try
             {
@@ -429,7 +443,11 @@ public sealed class SyncProviderConnection : IDisposable
                 {
                     // InfoClass = 1 → CF_PLACEHOLDER_INFO_BASIC，PinState 在偏移 0
                     int hr = CfGetPlaceholderInfo(handle, 1, buf, 64, out uint retLen);
-                    if (hr < 0 || retLen < 4) return false;
+                    if (hr < 0 || retLen < 4)
+                    {
+                        FileLogger.Log($"TryHandlePinRequest: CfGetPlaceholderInfo 失败 hr=0x{(uint)hr:X8} retLen={retLen}: {fullPath}");
+                        return false;
+                    }
 
                     uint pinState = (uint)Marshal.ReadInt32(buf, 0);
                     if (pinState != 1) return false; // 不是 PINNED
@@ -438,7 +456,7 @@ public sealed class SyncProviderConnection : IDisposable
 
                 // 检测到 PINNED，记录日志并返回 true
                 // Windows 会自动触发 FETCH_DATA 完成水合，我们只需不干扰
-                FileLogger.Log($"PINNED 检测到，交给 Windows 处理水合: {fullPath}");
+                FileLogger.Log($"HYDRATE: PINNED 文件检测到，始终保留: {fullPath}");
                 return true;
             }
             finally { CloseHandle(handle); }
@@ -448,6 +466,38 @@ public sealed class SyncProviderConnection : IDisposable
             FileLogger.Log($"TryHandlePinRequest 异常: {ex.Message}");
             return false;
         }
+    }
+
+    /// <summary>
+    /// 读取文件的 PinState（供 HandleModifyFile 安全检查用）。
+    /// 返回: 0=Unspecified, 1=PINNED, 2=UNPINNED, -1=失败
+    /// </summary>
+    public static int ReadPinState(string fullPath)
+    {
+        try
+        {
+            IntPtr handle = CreateFileW(
+                fullPath,
+                0x00000080, // FILE_READ_ATTRIBUTES
+                0x00000007,
+                IntPtr.Zero, 3,
+                0x02100000, // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL
+                IntPtr.Zero);
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return -1;
+            try
+            {
+                IntPtr buf = Marshal.AllocHGlobal(64);
+                try
+                {
+                    int hr = CfGetPlaceholderInfo(handle, 1, buf, 64, out uint retLen);
+                    if (hr < 0 || retLen < 4) return -1;
+                    return Marshal.ReadInt32(buf, 0);
+                }
+                finally { Marshal.FreeHGlobal(buf); }
+            }
+            finally { CloseHandle(handle); }
+        }
+        catch { return -1; }
     }
 
     /// <summary>
@@ -654,12 +704,16 @@ public sealed class SyncProviderConnection : IDisposable
                 response?.Dispose();
             }
 
-            // 标记为 ModList 抑制 + 设置 IN_SYNC + 刷新父目录状态
+            // 标记为 ModList 抑制 + 设置 IN_SYNC + 刷新父目录状态 + 记录 mtime防止假上传
             if (_syncEngine != null && _syncFolder != null)
             {
                 var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
                 _syncEngine.SuppressForModList(fullPath);
                 _syncEngine.SetInSyncAfterHydration(fullPath);
+                // 记录水合文件的 mtime，防止后续 Changed 事件触发假上传
+                _syncEngine.RecordHydratedFileMtime(fullPath, relativePath);
+                // 延长 RecentlySynced 窗口，防止水合后 10+ 秒的属性变更触发上传
+                _syncEngine.MarkRecentlySynced(fullPath, 15);
             }
 
             } // end try (EndBusy)
@@ -697,7 +751,7 @@ public sealed class SyncProviderConnection : IDisposable
             try
             {
                 IntPtr fh = CreateFileW(fullPath,
-                    0x00000180, 0x00000007, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+                    0x00000080, 0x00000007, IntPtr.Zero, 3, 0x02100000, IntPtr.Zero);
                 if (fh != IntPtr.Zero && fh != new IntPtr(-1))
                 {
                     try

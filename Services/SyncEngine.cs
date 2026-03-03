@@ -105,7 +105,15 @@ public sealed class SyncEngine : IDisposable
     {
         _recentlySynced[fullPath] = DateTime.UtcNow.Ticks;
     }
-
+    /// <summary>
+    /// 标记路径为“最近已同步”，并额外延长抑制窗口。
+    /// 用于 FETCH_DATA 水合和 FETCH_PLACEHOLDERS 等场景，属性变更可能在多秒后才触发 Changed。
+    /// </summary>
+    public void MarkRecentlySynced(string fullPath, int extraSeconds)
+    {
+        // 将时间戳设到未来，这样 IsRecentlySynced 的 (now - ticks) < 2s 检查会一直返回 true
+        _recentlySynced[fullPath] = DateTime.UtcNow.Ticks + TimeSpan.FromSeconds(extraSeconds).Ticks;
+    }
     public SyncEngine(SyncApiService api, string syncFolder)
     {
         _api = api;
@@ -450,6 +458,29 @@ public sealed class SyncEngine : IDisposable
         catch { return; }
 
         FileLogger.Log($"  准备上传修改: {evt.RelativePath}");
+
+        // PinState 安全检查：如果文件的 PinState 是 PINNED(1) 或 UNPINNED(2)，
+        // 说明这是“始终保留”或“释放空间”触发的属性变更，不是真实修改
+        try
+        {
+            var fii = new FileInfo(evt.FullPath);
+            if (fii.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
+            {
+                int pinState = SyncProviderConnection.ReadPinState(evt.FullPath);
+                if (pinState == 1) // PINNED
+                {
+                    FileLogger.Log($"  跳过 PINNED 文件(始终保留): {evt.RelativePath}");
+                    return;
+                }
+                if (pinState == 2) // UNPINNED
+                {
+                    FileLogger.Log($"  跳过 UNPINNED 文件(释放空间): {evt.RelativePath}");
+                    return;
+                }
+            }
+        }
+        catch { }
+
         await UploadFileWithRetry(evt.FullPath, evt.RelativePath, forceUpload: true);
     }
 
@@ -897,6 +928,24 @@ public sealed class SyncEngine : IDisposable
         {
             FileLogger.Log($"  SetInSyncAfterHydration 异常: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// FETCH_DATA 水合完成后记录文件 mtime，防止后续 Changed 事件触发假上传。
+    /// 水合后的文件 mtime 未变，不应被视为"用户修改了文件"。
+    /// </summary>
+    public void RecordHydratedFileMtime(string fullPath, string relativePath)
+    {
+        try
+        {
+            if (File.Exists(fullPath))
+            {
+                var fi = new FileInfo(fullPath);
+                _lastUploadedMtime[relativePath] = fi.LastWriteTimeUtc.Ticks;
+                FileLogger.Log($"  已记录水合文件mtime: {relativePath}");
+            }
+        }
+        catch { }
     }
 
     /// <summary>
