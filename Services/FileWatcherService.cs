@@ -128,6 +128,12 @@ public sealed class FileWatcherService : IDisposable
 
     private void OnChanged(object sender, FileSystemEventArgs e)
     {
+        // 优先检查"释放空间"（PinState → UNPINNED）— 不受抑制窗口限制
+        // 用户可能在 Pin 水合刚完成后立即释放空间，此时 RecentlySynced/ModList 抑制仍活跃，
+        // 若不优先检查，Changed 事件会被吞掉导致脱水不执行（蓝圈 bug）
+        if (SyncProviderConnection.TryHandleDehydrateRequest(e.FullPath))
+            return;
+
         // 过滤反馈事件（CfConvertToPlaceholder / CfSetInSyncState / FETCH_DATA 触发的属性变化）
         if (_engine.IsRecentlySynced(e.FullPath))
         {
@@ -141,10 +147,6 @@ public sealed class FileWatcherService : IDisposable
             FileLogger.Log($"FileWatcher.Changed 跳过(ModList抑制): {e.FullPath}");
             return;
         }
-
-        // 优先检查是否是"释放空间"触发的属性变化（PinState → UNPINNED）
-        if (SyncProviderConnection.TryHandleDehydrateRequest(e.FullPath))
-            return;
 
         // 检查是否是"始终保留在此设备上"触发的属性变化（PinState → PINNED）
         if (SyncProviderConnection.TryHandlePinRequest(e.FullPath))
