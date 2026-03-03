@@ -146,6 +146,10 @@ public sealed class FileWatcherService : IDisposable
         if (SyncProviderConnection.TryHandleDehydrateRequest(e.FullPath))
             return;
 
+        // 检查是否是"始终保留在此设备上"触发的属性变化（PinState → PINNED）
+        if (SyncProviderConnection.TryHandlePinRequest(e.FullPath))
+            return;
+
         // 只处理文件修改（目录的 Changed 忽略）
         if (!File.Exists(e.FullPath) || Directory.Exists(e.FullPath)) return;
 

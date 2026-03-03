@@ -379,6 +379,115 @@ public sealed class SyncProviderConnection : IDisposable
     }
 
     /// <summary>
+    /// 检测并处理"始终保留在此设备上"请求。
+    /// 用户右键选择后，Windows 将 PinState 设为 PINNED。
+    /// 检测到后主动调用 CfHydratePlaceholder 水合本地占位符。
+    /// CfHydratePlaceholder 会内部触发 FETCH_DATA 回调完成实际下载。
+    /// </summary>
+    public static bool TryHandlePinRequest(string fullPath)
+    {
+        try
+        {
+            bool isDir = Directory.Exists(fullPath);
+            bool isFile = !isDir && File.Exists(fullPath);
+            if (!isDir && !isFile) return false;
+
+            // 冷却检查：同一路径 60 秒内不重复水合
+            var nowTicks = DateTime.UtcNow.Ticks;
+            if (_dehydrateCooldown.TryGetValue("PIN:" + fullPath, out var lastTicks))
+            {
+                if ((nowTicks - lastTicks) < TimeSpan.TicksPerSecond * 60)
+                    return true;
+            }
+
+            IntPtr handle = CreateFileW(
+                fullPath,
+                0x00000180, // FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+                0x00000007, // FILE_SHARE_READ | WRITE | DELETE
+                IntPtr.Zero,
+                3,          // OPEN_EXISTING
+                0x02000000, // FILE_FLAG_BACKUP_SEMANTICS
+                IntPtr.Zero);
+
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
+
+            try
+            {
+                IntPtr buf = Marshal.AllocHGlobal(256);
+                try
+                {
+                    int hr = CfGetPlaceholderInfo(handle, 0, buf, 256, out uint retLen);
+                    if (hr < 0 || retLen < 8) return false;
+
+                    uint pinState = (uint)Marshal.ReadInt32(buf, 0);
+                    if (pinState != 1) return false; // 不是 PINNED
+                }
+                finally { Marshal.FreeHGlobal(buf); }
+
+                if (isDir)
+                {
+                    // 目录：递归水合所有 dehydrated 文件
+                    FileLogger.Log($"HYDRATE: PINNED 目录检测到，始终保留: {fullPath}");
+                    int count = 0;
+                    foreach (var file in Directory.GetFiles(fullPath, "*", SearchOption.AllDirectories))
+                    {
+                        try
+                        {
+                            var fi = new FileInfo(file);
+                            if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
+                            if (!fi.Attributes.HasFlag(FileAttributes.Offline)) continue; // 已 hydrated，跳过
+
+                            var fh = CreateFileW(file,
+                                0x00000180,
+                                0x00000007,
+                                IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+                            if (fh == IntPtr.Zero || fh == new IntPtr(-1)) continue;
+                            try
+                            {
+                                int hhr = CfHydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
+                                if (hhr >= 0) count++;
+                                else FileLogger.Log($"  Hydrate 失败: 0x{(uint)hhr:X8} {Path.GetFileName(file)}");
+                            }
+                            finally { CloseHandle(fh); }
+                        }
+                        catch { }
+                    }
+                    FileLogger.Log($"  已水合: {fullPath} ({count}个文件)");
+                    _dehydrateCooldown["PIN:" + fullPath] = DateTime.UtcNow.Ticks;
+                    return true;
+                }
+                else
+                {
+                    // 单个文件
+                    var fi = new FileInfo(fullPath);
+                    if (!fi.Attributes.HasFlag(FileAttributes.Offline)) return true; // 已 hydrated
+                    if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) return false; // 不是 placeholder
+
+                    FileLogger.Log($"HYDRATE: PINNED 文件检测到，始终保留: {fullPath}");
+                    int hhr = CfHydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
+                    if (hhr >= 0)
+                    {
+                        FileLogger.Log($"  已水合: {fullPath}");
+                        _dehydrateCooldown["PIN:" + fullPath] = DateTime.UtcNow.Ticks;
+                        return true;
+                    }
+                    else
+                    {
+                        FileLogger.Log($"  Hydrate 失败: 0x{(uint)hhr:X8} {fullPath}");
+                        return false;
+                    }
+                }
+            }
+            finally { CloseHandle(handle); }
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"TryHandlePinRequest 异常: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
     /// 从 NormalizedPath 提取服务端相对路径。
     /// NormalizedPath 格式: \Users\hhz\EhangSync\Documents (volume-relative, 无盘符)
     /// _syncFolder 格式:   C:\Users\hhz\EhangSync

@@ -73,6 +73,14 @@ internal static class CldApi
         IntPtr Overlapped);
 
     [DllImport("cldapi.dll", ExactSpelling = true)]
+    public static extern int CfHydratePlaceholder(
+        IntPtr FileHandle,
+        long StartingOffset,
+        long Length,
+        uint HydrateFlags,
+        IntPtr Overlapped);
+
+    [DllImport("cldapi.dll", ExactSpelling = true)]
     public static extern int CfUpdatePlaceholder(
         IntPtr FileHandle,
         in CF_FS_METADATA FsMetadata,
