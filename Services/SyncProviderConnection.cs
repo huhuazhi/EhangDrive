@@ -1,4 +1,5 @@
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using EhangNAS_Sync.Models;
@@ -282,11 +283,30 @@ public sealed class SyncProviderConnection : IDisposable
             if (!isDir && !isFile) return false;
 
             // 冷却检查：同一路径 60 秒内不重复脱水
+            // 但必须验证文件实际状态：如果文件已水合（非Offline），说明用户做了
+            // Unpin → Pin → Unpin 操作，此时必须重新脱水，不能跳过
             var nowTicks = DateTime.UtcNow.Ticks;
             if (_dehydrateCooldown.TryGetValue(fullPath, out var lastTicks))
             {
                 if ((nowTicks - lastTicks) < TimeSpan.TicksPerSecond * 60)
-                    return true; // 仍在冷却期，静默跳过（返回 true 阻止后续 Changed 处理）
+                {
+                    bool needsDehydration = false;
+                    try
+                    {
+                        if (isFile)
+                        {
+                            var fi = new FileInfo(fullPath);
+                            needsDehydration = fi.Attributes.HasFlag(FileAttributes.ReparsePoint) && !fi.Attributes.HasFlag(FileAttributes.Offline);
+                        }
+                        else if (isDir)
+                            needsDehydration = Directory.GetFiles(fullPath, "*", SearchOption.AllDirectories)
+                                .Any(f => { try { var fi2 = new FileInfo(f); return fi2.Attributes.HasFlag(FileAttributes.ReparsePoint) && !fi2.Attributes.HasFlag(FileAttributes.Offline); } catch { return false; } });
+                    }
+                    catch { }
+                    if (!needsDehydration)
+                        return true; // 文件已脱水，安全跳过
+                    FileLogger.Log($"TryHandleDehydrateRequest 冷却期内但文件需要脱水，继续处理: {fullPath}");
+                }
             }
 
             IntPtr handle = CreateFileW(
@@ -397,11 +417,27 @@ public sealed class SyncProviderConnection : IDisposable
             }
 
             // 冷却检查：同一路径 60 秒内不重复水合
+            // 但必须验证文件实际状态：如果文件已脱水（Offline），说明用户做了
+            // Pin → Unpin → Pin 操作，此时必须重新水合，不能跳过
             var nowTicks = DateTime.UtcNow.Ticks;
             if (_dehydrateCooldown.TryGetValue("PIN:" + fullPath, out var lastTicks))
             {
                 if ((nowTicks - lastTicks) < TimeSpan.TicksPerSecond * 60)
-                    return true;
+                {
+                    bool needsHydration = false;
+                    try
+                    {
+                        if (isFile)
+                            needsHydration = new FileInfo(fullPath).Attributes.HasFlag(FileAttributes.Offline);
+                        else if (isDir)
+                            needsHydration = Directory.GetFiles(fullPath, "*", SearchOption.AllDirectories)
+                                .Any(f => { try { return new FileInfo(f).Attributes.HasFlag(FileAttributes.Offline) && new FileInfo(f).Attributes.HasFlag(FileAttributes.ReparsePoint); } catch { return false; } });
+                    }
+                    catch { }
+                    if (!needsHydration)
+                        return true; // 文件已水合，安全跳过
+                    FileLogger.Log($"TryHandlePinRequest 冷却期内但文件需要水合，继续处理: {fullPath}");
+                }
             }
 
             IntPtr handle = CreateFileW(
