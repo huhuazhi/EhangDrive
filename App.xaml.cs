@@ -122,7 +122,8 @@ public partial class App : Application
         }
 
         // ──── 连接同步根（保持云提供程序在线）────────────────────
-        var api = new SyncApiService(newConfig.Server, newConfig.Token);
+        var clientId = ConfigService.GetOrCreateClientId();
+        var api = new SyncApiService(newConfig.Server, newConfig.Token, clientId);
         try
         {
             _connection = new SyncProviderConnection();
@@ -143,16 +144,41 @@ public partial class App : Application
 
         // ──── 启动同步引擎（文件监听在全量同步完成后启动）───────
         _syncEngine = new SyncEngine(api, newConfig.SyncFolder);
+        SyncProviderConnection.SetSyncEngine(_syncEngine);
 
         _fileWatcher = new FileWatcherService(newConfig.SyncFolder, _syncEngine);
         // 注意：_fileWatcher.Start() 延迟到全量同步完成后调用
         // 避免全量同步中的文件操作（删除旧文件→重建占位符）被误识别为用户操作
+
+        // ──── 清空上一轮的日志和传输列表 ─────────────────────────
+        SyncStatusManager.Instance.Clear();
+
+        // ──── 先创建并显示主窗口（让 UI 立即可见）───────────────
+        _mainWindow = new MainWindow(newConfig, _connection,
+            onLogout: HandleLogout,
+            onChangeSyncFolder: HandleChangeSyncFolder,
+            syncEngine: _syncEngine,
+            api: api);
+
+        // ──── 创建托盘图标 ───────────────────────────────────────
+        _trayIcon = new TrayIconService(
+            newConfig.SyncFolder,
+            showMainWindow: () => { _mainWindow?.Show(); _mainWindow?.Activate(); },
+            showSettings: () => _mainWindow?.ShowSettingsTab(),
+            exitApp: () =>
+            {
+                CleanupSession();
+                _mainWindow?.ExitApplication();
+            });
+
+        _mainWindow.Show();
 
         // ──── 首次全量同步（如果尚未完成）──────────────────────
         bool initialSyncDone = InitialSyncService.IsCompleted(newConfig.SyncFolder);
         if (!initialSyncDone)
         {
             FileLogger.Log("InitialSync: 未完成标记，执行全量同步...");
+            SyncStatusManager.Instance.AddLog("🔄", "正在执行全量同步...");
             try
             {
                 await InitialSyncService.SyncAsync(api, newConfig.SyncFolder);
@@ -169,7 +195,6 @@ public partial class App : Application
         }
 
         // ──── 注册客户端 ─────────────────────────────────────────
-        var clientId = ConfigService.GetOrCreateClientId();
         var hostname = ConfigService.GetHostname();
         var localIp = ConfigService.GetLocalIp();
         RegisterClientResponse registerResult;
@@ -190,6 +215,7 @@ public partial class App : Application
             FileLogger.Log("服务端要求重新全量同步（该客户端曾被删除）");
             InitialSyncService.ClearMarker(newConfig.SyncFolder);
             initialSyncDone = false;
+            SyncStatusManager.Instance.AddLog("🔄", "服务端要求重新全量同步...");
             try
             {
                 await InitialSyncService.SyncAsync(api, newConfig.SyncFolder);
@@ -221,29 +247,6 @@ public partial class App : Application
         }
 
         FileLogger.Log($"同步引擎+文件监听 已启动, folder={newConfig.SyncFolder}, clients={clientCount}");
-
-        // ──── 清空上一轮的日志和传输列表 ─────────────────────────
-        SyncStatusManager.Instance.Clear();
-
-        // ──── 创建主窗口 ─────────────────────────────────────────
-        _mainWindow = new MainWindow(newConfig, _connection,
-            onLogout: HandleLogout,
-            onChangeSyncFolder: HandleChangeSyncFolder,
-            syncEngine: _syncEngine,
-            api: api);
-
-        // ──── 创建托盘图标 ───────────────────────────────────────
-        _trayIcon = new TrayIconService(
-            newConfig.SyncFolder,
-            showMainWindow: () => { _mainWindow?.Show(); _mainWindow?.Activate(); },
-            showSettings: () => _mainWindow?.ShowSettingsTab(),
-            exitApp: () =>
-            {
-                CleanupSession();
-                _mainWindow?.ExitApplication();
-            });
-
-        _mainWindow.Show();
     }
 
     // ═══════════════════════════════════════════════════════════════

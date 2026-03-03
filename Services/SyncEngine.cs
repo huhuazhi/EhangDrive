@@ -59,6 +59,32 @@ public sealed class SyncEngine : IDisposable
     private readonly ConcurrentDictionary<string, byte> _dirtyDirectories = new(StringComparer.OrdinalIgnoreCase);
     public bool HasDirtyDirectories => !_dirtyDirectories.IsEmpty;
 
+    // ModList 操作抑制：ModList 删除/脱水本地文件时，抑制 FileWatcher 产生的 Delete/Changed 事件
+    // key=fullPath, value=ticks
+    private readonly ConcurrentDictionary<string, long> _modListSuppressed = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 标记一个文件正在被 ModList 操作（删除/脱水），让 FileWatcher 忽略后续事件
+    /// </summary>
+    public void SuppressForModList(string fullPath)
+    {
+        _modListSuppressed[fullPath] = DateTime.UtcNow.Ticks;
+    }
+
+    /// <summary>
+    /// 检查路径是否被 ModList 抑制（5秒内）
+    /// </summary>
+    public bool IsModListSuppressed(string fullPath)
+    {
+        if (_modListSuppressed.TryGetValue(fullPath, out var ticks))
+        {
+            if ((DateTime.UtcNow.Ticks - ticks) < TimeSpan.FromSeconds(5).Ticks)
+                return true;
+            _modListSuppressed.TryRemove(fullPath, out _);
+        }
+        return false;
+    }
+
     /// <summary>
     /// 检查路径是否在最近被同步处理过（用于过滤反馈事件）
     /// </summary>
@@ -67,6 +93,14 @@ public sealed class SyncEngine : IDisposable
         if (_recentlySynced.TryGetValue(fullPath, out var ticks))
             return (DateTime.UtcNow.Ticks - ticks) < TimeSpan.FromSeconds(2).Ticks;
         return false;
+    }
+
+    /// <summary>
+    /// 立即标记路径为"最近已同步"，用于在 FileWatcher 线程上抑制后续 Changed 事件
+    /// </summary>
+    public void MarkRecentlySynced(string fullPath)
+    {
+        _recentlySynced[fullPath] = DateTime.UtcNow.Ticks;
     }
 
     public SyncEngine(SyncApiService api, string syncFolder)
@@ -230,23 +264,43 @@ public sealed class SyncEngine : IDisposable
     private async Task HandleRename(SyncEvent evt)
     {
         FileLogger.Log($"HandleRename: {evt.OldRelativePath} → {evt.RelativePath}");
-        SyncStatusManager.Instance.AddLog("🔵", $"重命名: {evt.OldRelativePath} → {evt.RelativePath}");
+
+
+        // 立即抑制新路径的 Changed 事件（Windows rename 会同时触发 Changed）
+        _recentlySynced[evt.FullPath] = DateTime.UtcNow.Ticks;
 
         bool ok = false;
+        bool isDir = Directory.Exists(evt.FullPath);
+
+        // 判断是同目录改名还是跨目录移动
+        var oldParent = Path.GetDirectoryName(evt.OldRelativePath ?? "")?.Replace('\\', '/') ?? "";
+        var newParent = Path.GetDirectoryName(evt.RelativePath)?.Replace('\\', '/') ?? "";
+        bool isMove = !string.Equals(oldParent, newParent, StringComparison.OrdinalIgnoreCase);
+        var actionName = isMove ? "移动" : "重命名";
+        SyncStatusManager.Instance.AddLog("🟢", $"{actionName}: {evt.OldRelativePath} → {evt.RelativePath}");
+
         try
         {
-            ok = await _api.RenameAsync(evt.OldRelativePath!, evt.RelativePath);
-            FileLogger.Log($"  RenameAsync → {ok}");
+            if (isMove)
+            {
+                ok = await _api.MoveAsync(evt.OldRelativePath!, evt.RelativePath);
+                FileLogger.Log($"  MoveAsync → {ok}");
+            }
+            else
+            {
+                ok = await _api.RenameAsync(evt.OldRelativePath!, evt.RelativePath, isDir);
+                FileLogger.Log($"  RenameAsync → {ok}");
+            }
         }
         catch (Exception ex)
         {
-            FileLogger.Log($"  RenameAsync 异常: {ex.Message}");
+            FileLogger.Log($"  {(isMove ? "MoveAsync" : "RenameAsync")} 异常: {ex.Message}");
         }
 
         if (!ok)
         {
             // Fallback: 服务端可能还没有旧路径(Created被延迟跳过了)，直接创建新路径
-            FileLogger.Log($"  重命名失败，尝试直接创建/上传: {evt.RelativePath}");
+            FileLogger.Log($"  {actionName}失败，尝试直接创建/上传: {evt.RelativePath}");
             if (Directory.Exists(evt.FullPath))
             {
                 ok = await _api.MkdirAsync(evt.RelativePath);
@@ -263,11 +317,17 @@ public sealed class SyncEngine : IDisposable
         if (ok)
         {
             ConvertToPlaceholderAndSync(evt.FullPath, evt.RelativePath);
-            SyncStatusManager.Instance.AddLog("✅", $"已重命名: {evt.RelativePath}");
+            // 目录重命名后需要刷新 IN_SYNC 状态（否则一直是蓝圈）
+            if (isDir)
+            {
+                _dirtyDirectories.TryAdd(evt.FullPath, 0);
+                FlushDirtyDirectories();
+            }
+            SyncStatusManager.Instance.AddLog("✅", $"已{actionName}: {evt.RelativePath}");
         }
         else
         {
-            SyncStatusManager.Instance.AddLog("❌", $"重命名失败: {evt.RelativePath}");
+            SyncStatusManager.Instance.AddLog("❌", $"{actionName}失败: {evt.RelativePath}");
         }
     }
 
@@ -324,6 +384,15 @@ public sealed class SyncEngine : IDisposable
     {
         FileLogger.Log($"HandleModifyFile: {evt.RelativePath}");
 
+        // 消费者侧二次检查：移动操作(HandleRename)会设置 _recentlySynced，
+        // 但 Changed 事件在 FileWatcher 回调时尚未被标记，已溜进队列。
+        // 此时 HandleRename 已执行完毕，这里再检查一次即可拦住。
+        if (IsRecentlySynced(evt.FullPath))
+        {
+            FileLogger.Log($"  消费者侧跳过(RecentlySynced): {evt.RelativePath}");
+            return;
+        }
+
         // 只处理文件
         if (!File.Exists(evt.FullPath) || Directory.Exists(evt.FullPath)) return;
 
@@ -342,6 +411,14 @@ public sealed class SyncEngine : IDisposable
         // 等文件写完
         await Task.Delay(1000);
         if (!File.Exists(evt.FullPath)) return;
+
+        // 延迟后二次检查：并发的 HandleRename/HandleCreateFile 可能在这 1 秒内
+        // 已经完成了 move/rename 并设置了 _recentlySynced，此时不应再上传。
+        if (IsRecentlySynced(evt.FullPath))
+        {
+            FileLogger.Log($"  延迟后跳过(RecentlySynced): {evt.RelativePath}");
+            return;
+        }
 
         try
         {

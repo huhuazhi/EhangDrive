@@ -56,6 +56,12 @@ public class ModItem
 
     [JsonPropertyName("action")]
     public string Action { get; set; } = "update";
+
+    [JsonPropertyName("is_dir")]
+    public bool IsDir { get; set; }
+
+    [JsonPropertyName("old_path")]
+    public string OldPath { get; set; } = "";
 }
 
 public class ModListResponse
@@ -117,10 +123,12 @@ public class SyncApiService
 {
     private readonly HttpClient _http;
     private readonly string _baseUrl;
+    private readonly string _clientId;
 
-    public SyncApiService(string server, string token)
+    public SyncApiService(string server, string token, string clientId)
     {
         _baseUrl = $"http://{server}/api/sync-config";
+        _clientId = clientId;
         _http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) }; // 大文件上传需要更长超时
         _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
     }
@@ -235,7 +243,7 @@ public class SyncApiService
     {
         try
         {
-            var url = $"{_baseUrl}/modlist";
+            var url = $"{_baseUrl}/modlist?client_id={Uri.EscapeDataString(_clientId)}";
             var response = await _http.GetAsync(url);
             if (!response.IsSuccessStatusCode)
             {
@@ -286,7 +294,7 @@ public class SyncApiService
         try
         {
             var url = $"{_baseUrl}/mkdir";
-            var payload = JsonSerializer.Serialize(new { path = relativePath });
+            var payload = JsonSerializer.Serialize(new { path = relativePath, client_id = _clientId });
             var content = new StringContent(payload, Encoding.UTF8, "application/json");
             var response = await _http.PostAsync(url, content);
             return response.IsSuccessStatusCode;
@@ -317,7 +325,7 @@ public class SyncApiService
                 fileContent = new StreamContent(fs);
             fileContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
 
-            var url = $"{_baseUrl}/upload-stream?path={Uri.EscapeDataString(relativePath)}&mtime={mtime}&offset=0";
+            var url = $"{_baseUrl}/upload-stream?path={Uri.EscapeDataString(relativePath)}&mtime={mtime}&offset=0&client_id={Uri.EscapeDataString(_clientId)}";
             FileLogger.Log($"UploadFileAsync: PUT {url} (size={totalSize})");
             var request = new HttpRequestMessage(HttpMethod.Put, url) { Content = fileContent };
 
@@ -401,7 +409,7 @@ public class SyncApiService
         try
         {
             var url = $"{_baseUrl}/delete";
-            var payload = JsonSerializer.Serialize(new { path = relativePath });
+            var payload = JsonSerializer.Serialize(new { path = relativePath, client_id = _clientId });
             FileLogger.Log($"DeleteAsync: POST {url} (path={relativePath})");
             var content = new StringContent(payload, Encoding.UTF8, "application/json");
             var response = await _http.PostAsync(url, content);
@@ -416,14 +424,14 @@ public class SyncApiService
     }
 
     /// <summary>
-    /// 重命名服务端文件或目录
+    /// 重命名服务端文件或目录（同目录内改名）
     /// </summary>
-    public async Task<bool> RenameAsync(string oldPath, string newPath)
+    public async Task<bool> RenameAsync(string oldPath, string newPath, bool isDir = false)
     {
         try
         {
             var url = $"{_baseUrl}/rename";
-            var payload = JsonSerializer.Serialize(new { old_path = oldPath, new_path = newPath });
+            var payload = JsonSerializer.Serialize(new { old_path = oldPath, new_path = newPath, client_id = _clientId, is_dir = isDir });
             FileLogger.Log($"RenameAsync: POST {url} ({oldPath} → {newPath})");
             var content = new StringContent(payload, Encoding.UTF8, "application/json");
             var response = await _http.PostAsync(url, content);
@@ -433,6 +441,28 @@ public class SyncApiService
         catch (Exception ex)
         {
             FileLogger.Log($"  RenameAsync 异常: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 移动服务端文件或目录（跨目录移动）
+    /// </summary>
+    public async Task<bool> MoveAsync(string src, string dst)
+    {
+        try
+        {
+            var url = $"{_baseUrl}/move";
+            var payload = JsonSerializer.Serialize(new { src, dst, client_id = _clientId });
+            FileLogger.Log($"MoveAsync: POST {url} ({src} → {dst})");
+            var content = new StringContent(payload, Encoding.UTF8, "application/json");
+            var response = await _http.PostAsync(url, content);
+            FileLogger.Log($"  HTTP {(int)response.StatusCode}");
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"  MoveAsync 异常: {ex.Message}");
             return false;
         }
     }

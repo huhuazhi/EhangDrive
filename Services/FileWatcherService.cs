@@ -128,10 +128,17 @@ public sealed class FileWatcherService : IDisposable
 
     private void OnChanged(object sender, FileSystemEventArgs e)
     {
-        // 过滤反馋事件（CfConvertToPlaceholder / CfSetInSyncState 触发的属性变化）
+        // 过滤反馈事件（CfConvertToPlaceholder / CfSetInSyncState / FETCH_DATA 触发的属性变化）
         if (_engine.IsRecentlySynced(e.FullPath))
         {
-            // FileLogger.Log($"FileWatcher.Changed 跳过(反馋): {e.FullPath}");
+            FileLogger.Log($"FileWatcher.Changed 跳过(RecentlySynced): {e.FullPath}");
+            return;
+        }
+
+        // ModList 脱水操作引起的 Changed 不要重新上传
+        if (_engine.IsModListSuppressed(e.FullPath))
+        {
+            FileLogger.Log($"FileWatcher.Changed 跳过(ModList抑制): {e.FullPath}");
             return;
         }
 
@@ -147,6 +154,7 @@ public sealed class FileWatcherService : IDisposable
 
         if (SyncEngine.ShouldSkipPath(relativePath)) return;
 
+        FileLogger.Log($"FileWatcher.Changed: {e.FullPath}");
         _engine.Enqueue(new SyncEvent(
             SyncEventType.ModifyFile,
             e.FullPath,
@@ -157,9 +165,12 @@ public sealed class FileWatcherService : IDisposable
     {
         FileLogger.Log($"FileWatcher.Deleted: {e.FullPath}");
 
-        // 注意：这里不检查 IsRecentlySynced！
-        // CfConvertToPlaceholder 不会触发 Delete 事件，Delete 一定是用户真实操作。
-        // _pendingDeletes 3秒延迟已足够防止 move 场景下的误删。
+        // ModList 删除本地文件时不要级联删除服务端
+        if (_engine.IsModListSuppressed(e.FullPath))
+        {
+            FileLogger.Log($"  跳过(ModList抑制): {e.FullPath}");
+            return;
+        }
 
         var relativePath = Path.GetRelativePath(_syncFolder, e.FullPath)
                                .Replace('\\', '/');
@@ -179,6 +190,9 @@ public sealed class FileWatcherService : IDisposable
 
         // 过滤 CfConvertToPlaceholder 触发的反馈事件
         if (_engine.IsRecentlySynced(e.FullPath)) return;
+
+        // 立即标记新路径，抑制随后到来的 Changed 事件（Windows 重命名会同时触发 Changed）
+        _engine.MarkRecentlySynced(e.FullPath);
 
         var relativePath = Path.GetRelativePath(_syncFolder, e.FullPath)
                                .Replace('\\', '/');

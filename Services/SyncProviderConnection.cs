@@ -18,6 +18,7 @@ public sealed class SyncProviderConnection : IDisposable
     // 静态字段，供回调函数访问
     private static SyncApiService? _api;
     private static string? _syncFolder;
+    private static SyncEngine? _syncEngine;
 
     // 必须持有委托引用，防止 GC 回收导致回调崩溃
     private CF_CALLBACK? _fetchPlaceholdersCallback;
@@ -27,6 +28,14 @@ public sealed class SyncProviderConnection : IDisposable
     /// <summary>
     /// 连接到已注册的同步根目录
     /// </summary>
+    /// <summary>
+    /// 延迟设置 SyncEngine（Connect 时可能尚未创建）
+    /// </summary>
+    public static void SetSyncEngine(SyncEngine engine)
+    {
+        _syncEngine = engine;
+    }
+
     public void Connect(string syncFolderPath, SyncApiService api)
     {
         if (_connected) return;
@@ -431,6 +440,13 @@ public sealed class SyncProviderConnection : IDisposable
             // 报告下载完成
             CfReportProviderProgress(connectionKey, transferKey, fileSize, requiredOffset + data.Length);
 
+            // 在 CfExecute 写入数据之前就标记抑制，防止 Changed 事件竞态
+            if (_syncEngine != null && _syncFolder != null)
+            {
+                var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
+                _syncEngine.MarkRecentlySynced(fullPath);
+            }
+
             // 通过 CfExecute + TRANSFER_DATA 将数据传给 Windows
             var pinnedData = GCHandle.Alloc(data, GCHandleType.Pinned);
             try
@@ -463,6 +479,13 @@ public sealed class SyncProviderConnection : IDisposable
             }
 
             FileLogger.Log($"  已下载: {relativePath} ({data.Length} bytes)");
+
+            // 标记为 ModList 抑制，防止 FETCH_DATA 下载后 FileWatcher 触发重新上传
+            if (_syncEngine != null && _syncFolder != null)
+            {
+                var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
+                _syncEngine.SuppressForModList(fullPath);
+            }
         }
         catch (Exception ex)
         {

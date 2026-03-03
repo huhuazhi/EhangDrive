@@ -84,6 +84,12 @@ public sealed class ModListPollingService : IDisposable
             return;
         }
 
+        if (item.Action == "move" && !string.IsNullOrEmpty(item.OldPath))
+        {
+            await HandleRemoteMove(item, localPath);
+            return;
+        }
+
         // action == "update"
         await HandleRemoteUpdate(item, localPath);
     }
@@ -101,8 +107,10 @@ public sealed class ModListPollingService : IDisposable
                 // 只删除 placeholder 文件（有 ReparsePoint 属性）
                 if (fi.Attributes.HasFlag(FileAttributes.ReparsePoint))
                 {
+                    _syncEngine.SuppressForModList(localPath);
                     File.Delete(localPath);
                     FileLogger.Log($"ModList: 远程删除 → 已删本地 placeholder: {item.Path}");
+                    SyncStatusManager.Instance.AddLog("🗑️", $"已删除: {item.Path}");
                 }
             }
             catch (Exception ex)
@@ -114,14 +122,88 @@ public sealed class ModListPollingService : IDisposable
         {
             try
             {
+                // 抑制目录下所有文件的 FileWatcher 事件
+                foreach (var f in Directory.GetFiles(localPath, "*", SearchOption.AllDirectories))
+                    _syncEngine.SuppressForModList(f);
+                _syncEngine.SuppressForModList(localPath);
                 Directory.Delete(localPath, recursive: true);
                 FileLogger.Log($"ModList: 远程删除目录 → 已删本地目录: {item.Path}");
+                SyncStatusManager.Instance.AddLog("🗑️", $"已删除文件夹: {item.Path}");
             }
             catch (Exception ex)
             {
                 FileLogger.Log($"ModList: 删除本地目录失败: {item.Path} - {ex.Message}");
             }
         }
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 处理远程 move/rename：本地执行 File.Move / Directory.Move，保留已下载内容
+    /// </summary>
+    private Task HandleRemoteMove(ModItem item, string newLocalPath)
+    {
+        string oldLocalPath = Path.Combine(_syncFolder, item.OldPath.Replace('/', '\\'));
+
+        if (item.IsDir)
+        {
+            if (Directory.Exists(oldLocalPath))
+            {
+                try
+                {
+                    // 抑制旧路径和新路径下所有文件的 FileWatcher 事件
+                    foreach (var f in Directory.GetFiles(oldLocalPath, "*", SearchOption.AllDirectories))
+                    {
+                        _syncEngine.SuppressForModList(f);
+                        var rel = Path.GetRelativePath(oldLocalPath, f);
+                        var newF = Path.Combine(newLocalPath, rel);
+                        _syncEngine.MarkRecentlySynced(newF);
+                    }
+                    _syncEngine.SuppressForModList(oldLocalPath);
+                    _syncEngine.MarkRecentlySynced(newLocalPath);
+
+                    Directory.CreateDirectory(Path.GetDirectoryName(newLocalPath)!);
+                    Directory.Move(oldLocalPath, newLocalPath);
+                    FileLogger.Log($"ModList: 远程移动目录 → {item.OldPath} → {item.Path}");
+                    SyncStatusManager.Instance.AddLog("📁", $"移动文件夹: {item.OldPath} → {item.Path}");
+                }
+                catch (Exception ex)
+                {
+                    FileLogger.Log($"ModList: 移动目录失败: {item.OldPath} → {item.Path} - {ex.Message}");
+                }
+            }
+            else if (!Directory.Exists(newLocalPath))
+            {
+                CreatePlaceholderForItem(item, newLocalPath);
+                FileLogger.Log($"ModList: 远程移动目录(旧不存在) → 创建 placeholder: {item.Path}");
+            }
+        }
+        else
+        {
+            if (File.Exists(oldLocalPath))
+            {
+                try
+                {
+                    _syncEngine.SuppressForModList(oldLocalPath);
+                    _syncEngine.MarkRecentlySynced(newLocalPath);
+
+                    Directory.CreateDirectory(Path.GetDirectoryName(newLocalPath)!);
+                    File.Move(oldLocalPath, newLocalPath, overwrite: true);
+                    FileLogger.Log($"ModList: 远程移动文件 → {item.OldPath} → {item.Path}");
+                    SyncStatusManager.Instance.AddLog("📄", $"移动文件: {item.OldPath} → {item.Path}");
+                }
+                catch (Exception ex)
+                {
+                    FileLogger.Log($"ModList: 移动文件失败: {item.OldPath} → {item.Path} - {ex.Message}");
+                }
+            }
+            else if (!File.Exists(newLocalPath))
+            {
+                CreatePlaceholderForItem(item, newLocalPath);
+                FileLogger.Log($"ModList: 远程移动文件(旧不存在) → 创建 placeholder: {item.Path}");
+            }
+        }
+
         return Task.CompletedTask;
     }
 
@@ -135,10 +217,21 @@ public sealed class ModListPollingService : IDisposable
     /// </summary>
     private Task HandleRemoteUpdate(ModItem item, string localPath)
     {
+        // ── 目录处理 ──
+        if (item.IsDir)
+        {
+            if (!Directory.Exists(localPath))
+            {
+                CreatePlaceholderForItem(item, localPath);
+            }
+            return Task.CompletedTask;
+        }
+
+        // ── 文件处理 ──
         if (!File.Exists(localPath))
         {
             // 本地不存在 → 创建占位符
-            CreatePlaceholderForFile(item, localPath);
+            CreatePlaceholderForItem(item, localPath);
             return Task.CompletedTask;
         }
 
@@ -147,12 +240,25 @@ public sealed class ModListPollingService : IDisposable
         // 不是 placeholder → 不管（普通文件由 FileWatcher 处理）
         if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) return Task.CompletedTask;
 
-        // 已脱水(Offline) → 不管，下次打开自然拉最新
-        if (fi.Attributes.HasFlag(FileAttributes.Offline)) return Task.CompletedTask;
-
-        // 文件是 hydrated 的 placeholder（绿勾），需要检查 mtime
+        // 文件的 mtime
         long localMtime = new DateTimeOffset(File.GetLastWriteTimeUtc(localPath)).ToUnixTimeSeconds();
         long cloudMtime = item.Mtime;
+
+        // 已脱水(Offline)的 placeholder：如果云端版本更新，需要更新元数据（mtime/size）
+        // 这样 Explorer 显示正确大小，下次打开 FETCH_DATA 拉最新
+        if (fi.Attributes.HasFlag(FileAttributes.Offline))
+        {
+            if (cloudMtime > localMtime)
+            {
+                FileLogger.Log($"ModList: 白云文件元数据更新: {item.Path} (cloud={cloudMtime}, local={localMtime}, size={item.Size})");
+                _syncEngine.SuppressForModList(localPath);
+                UpdateAndDehydrateFile(localPath, item.Mtime, item.Size);
+                SyncStatusManager.Instance.AddLog("☁️", $"云端已更新: {item.Path}");
+            }
+            return Task.CompletedTask;
+        }
+
+        // 文件是 hydrated 的 placeholder（绿勾），需要检查 mtime
 
         if (localMtime == cloudMtime)
         {
@@ -160,8 +266,16 @@ public sealed class ModListPollingService : IDisposable
             return Task.CompletedTask;
         }
 
-        // mtime 不同 → 别人修改/上传的，脱水本地文件
+        if (cloudMtime < localMtime)
+        {
+            // 云端 mtime 比本地更旧 → 本地刚修改过还没被 modlist 反映，跳过
+            FileLogger.Log($"ModList: 跳过(本地更新): {item.Path} (cloud={cloudMtime}, local={localMtime})");
+            return Task.CompletedTask;
+        }
+
+        // cloudMtime > localMtime → 别人修改/上传的，脱水本地文件
         FileLogger.Log($"ModList: 云端变更，脱水本地: {item.Path} (cloud={cloudMtime}, local={localMtime})");
+        _syncEngine.SuppressForModList(localPath);
         UpdateAndDehydrateFile(localPath, item.Mtime, item.Size);
         SyncStatusManager.Instance.AddLog("☁️", $"云端已更新: {item.Path}");
         return Task.CompletedTask;
@@ -170,7 +284,7 @@ public sealed class ModListPollingService : IDisposable
     /// <summary>
     /// 为远程新文件创建本地占位符。
     /// </summary>
-    private void CreatePlaceholderForFile(ModItem item, string localPath)
+    private void CreatePlaceholderForItem(ModItem item, string localPath)
     {
         try
         {
@@ -193,8 +307,8 @@ public sealed class ModListPollingService : IDisposable
                     BasicInfo_LastAccessTime = fileTime,
                     BasicInfo_LastWriteTime = fileTime,
                     BasicInfo_ChangeTime = fileTime,
-                    BasicInfo_FileAttributes = FILE_ATTRIBUTE_NORMAL,
-                    FileSize = item.Size,
+                    BasicInfo_FileAttributes = item.IsDir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,
+                    FileSize = item.IsDir ? 0 : item.Size,
                 },
                 FileIdentity = CopyToHGlobal(identityBytes),
                 FileIdentityLength = (uint)identityBytes.Length,
@@ -212,8 +326,10 @@ public sealed class ModListPollingService : IDisposable
 
                 if (hr >= 0 && processed > 0)
                 {
-                    FileLogger.Log($"ModList: 创建占位符: {item.Path}");
-                    SyncStatusManager.Instance.AddLog("📄", $"新文件: {item.Path}");
+                    var icon = item.IsDir ? "📁" : "📄";
+                    var label = item.IsDir ? "新文件夹" : "新文件";
+                    FileLogger.Log($"ModList: 创建{(item.IsDir ? "目录" : "文件")}占位符: {item.Path}");
+                    SyncStatusManager.Instance.AddLog(icon, $"{label}: {item.Path}");
                 }
                 else
                 {
