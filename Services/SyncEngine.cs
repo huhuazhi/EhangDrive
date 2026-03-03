@@ -877,6 +877,18 @@ public sealed class SyncEngine : IDisposable
     {
         try
         {
+            // 记录 mtime，防止水合后超长延迟的 Changed 事件触发误上传
+            // （_lastUploadedMtime 仅在 UploadFileWithRetry 成功后记录，
+            //   下载/水合的文件没有记录，HandleModifyFile 的 mtime 检查会漏过）
+            try
+            {
+                var fi = new FileInfo(fullPath);
+                var relPath = Path.GetRelativePath(_syncFolder, fullPath).Replace('\\', '/');
+                _lastUploadedMtime[relPath] = fi.LastWriteTimeUtc.Ticks;
+                FileLogger.Log($"  \u8bb0\u5f55\u6c34\u5408mtime: {relPath} = {fi.LastWriteTimeUtc:o}");
+            }
+            catch { }
+
             using var handle = OpenFileForCldApi(fullPath);
             if (handle == null) return;
 

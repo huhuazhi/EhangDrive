@@ -390,7 +390,11 @@ public sealed class SyncProviderConnection : IDisposable
         {
             bool isDir = Directory.Exists(fullPath);
             bool isFile = !isDir && File.Exists(fullPath);
-            if (!isDir && !isFile) return false;
+            if (!isDir && !isFile)
+            {
+                FileLogger.Log($"TryHandlePinRequest 跳过(路径不存在): {fullPath}");
+                return false;
+            }
 
             // 冷却检查：同一路径 60 秒内不重复水合
             var nowTicks = DateTime.UtcNow.Ticks;
@@ -409,7 +413,11 @@ public sealed class SyncProviderConnection : IDisposable
                 0x02000000, // FILE_FLAG_BACKUP_SEMANTICS
                 IntPtr.Zero);
 
-            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+            {
+                FileLogger.Log($"TryHandlePinRequest 跳过(句柄打开失败): {fullPath}");
+                return false;
+            }
 
             try
             {
@@ -417,10 +425,18 @@ public sealed class SyncProviderConnection : IDisposable
                 try
                 {
                     int hr = CfGetPlaceholderInfo(handle, 0, buf, 256, out uint retLen);
-                    if (hr < 0 || retLen < 8) return false;
+                    if (hr < 0 || retLen < 8)
+                    {
+                        FileLogger.Log($"TryHandlePinRequest 跳过(PlaceholderInfo失败 hr=0x{(uint)hr:X8} retLen={retLen}): {fullPath}");
+                        return false;
+                    }
 
                     uint pinState = (uint)Marshal.ReadInt32(buf, 0);
-                    if (pinState != 1) return false; // 不是 PINNED
+                    if (pinState != 1)
+                    {
+                        FileLogger.Log($"TryHandlePinRequest 跳过(PinState={pinState}，非PINNED): {fullPath}");
+                        return false; // 不是 PINNED
+                    }
                 }
                 finally { Marshal.FreeHGlobal(buf); }
 
@@ -460,8 +476,18 @@ public sealed class SyncProviderConnection : IDisposable
                 {
                     // 单个文件
                     var fi = new FileInfo(fullPath);
-                    if (!fi.Attributes.HasFlag(FileAttributes.Offline)) return true; // 已 hydrated
-                    if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) return false; // 不是 placeholder
+                    if (!fi.Attributes.HasFlag(FileAttributes.Offline))
+                    {
+                        // 已 hydrated，刷新冷却防止过期后漏检
+                        _dehydrateCooldown["PIN:" + fullPath] = DateTime.UtcNow.Ticks;
+                        FileLogger.Log($"TryHandlePinRequest PINNED+已水合，刷新冷却: {fullPath}");
+                        return true;
+                    }
+                    if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                    {
+                        FileLogger.Log($"TryHandlePinRequest 跳过(非placeholder): {fullPath}");
+                        return false;
+                    }
 
                     FileLogger.Log($"HYDRATE: PINNED 文件检测到，始终保留: {fullPath}");
                     int hhr = CfHydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
