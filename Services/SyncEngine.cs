@@ -527,10 +527,12 @@ public sealed class SyncEngine : IDisposable
             Status = TransferStatus.Waiting,
         };
         SyncStatusManager.Instance.AddTransfer(transferItem);
+        bool transferEnded = false; // 跟踪是否已通过 RemoveTransfer 调用了 EndBusy
 
         // 获取上传槽位（最多 5 个并发上传）
         await _uploadSemaphore.WaitAsync();
         transferItem.Status = TransferStatus.Transferring;
+        var uploadStart = DateTime.UtcNow;
 
         try
         {
@@ -543,6 +545,7 @@ public sealed class SyncEngine : IDisposable
                 {
                     FileLogger.Log($"  文件已消失，跳过: {relativePath}");
                     SyncStatusManager.Instance.RemoveTransfer(transferItem);
+                    transferEnded = true;
                     return;
                 }
 
@@ -556,6 +559,7 @@ public sealed class SyncEngine : IDisposable
                         {
                             FileLogger.Log($"  已是 placeholder，跳过: {relativePath}");
                             SyncStatusManager.Instance.RemoveTransfer(transferItem);
+                            transferEnded = true;
                             return;
                         }
                     }
@@ -571,7 +575,7 @@ public sealed class SyncEngine : IDisposable
                     {
                         double pct = total > 0 ? uploaded * 100.0 / total : 0;
                         transferItem.Progress = pct;
-                        transferItem.Speed = FormatSpeed(uploaded, total);
+                        transferItem.Speed = FormatTransferSpeed(uploaded, total, uploadStart);
                     });
 
                     if (ok)
@@ -582,6 +586,7 @@ public sealed class SyncEngine : IDisposable
                         ConvertToPlaceholderAndSync(fullPath, relativePath);
                         transferItem.Progress = 100;
                         transferItem.Status = TransferStatus.Completed;
+                        transferItem.Speed = FormatFileSize(fileSize);
                         SyncStatusManager.Instance.AddLog("✅", $"已上传: {relativePath}");
                         return;
                     }
@@ -611,7 +616,7 @@ public sealed class SyncEngine : IDisposable
         {
             _uploadSemaphore.Release();
             _uploadingFiles.TryRemove(relativePath, out _);
-            // FlushDirtyDirectories 由 Task.Run 的 finally 在 Decrement 之后触发
+            if (!transferEnded) TrayIconService.Current?.EndBusy();
         }
     }
 
@@ -623,10 +628,27 @@ public sealed class SyncEngine : IDisposable
         return false;
     }
 
-    private static string FormatSpeed(long uploaded, long total)
+    /// <summary>
+    /// 格式化传输速度和剩余时间
+    /// </summary>
+    private static string FormatTransferSpeed(long transferred, long total, DateTime startTime)
     {
-        if (total <= 0) return "";
-        return FormatFileSize(total);
+        var elapsed = (DateTime.UtcNow - startTime).TotalSeconds;
+        if (elapsed < 0.5 || transferred <= 0) return FormatFileSize(total);
+
+        double speed = transferred / elapsed;
+        long remaining = total - transferred;
+        double eta = speed > 0 ? remaining / speed : 0;
+
+        string speedStr;
+        if (speed >= 1024 * 1024) speedStr = $"{speed / 1024 / 1024:F1} MB/s";
+        else if (speed >= 1024) speedStr = $"{speed / 1024:F0} KB/s";
+        else speedStr = $"{speed:F0} B/s";
+
+        if (eta < 1) return speedStr;
+        if (eta < 60) return $"{speedStr} · 剩余 {eta:F0}s";
+        if (eta < 3600) return $"{speedStr} · 剩余 {(int)(eta / 60)}:{(int)(eta % 60):D2}";
+        return $"{speedStr} · 剩余 {(int)(eta / 3600)}:{(int)(eta % 3600 / 60):D2}:{(int)(eta % 60):D2}";
     }
 
     private static string FormatFileSize(long bytes)

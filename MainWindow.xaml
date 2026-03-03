@@ -1,6 +1,7 @@
 <Window x:Class="EhangNAS_Sync.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:EhangNAS_Sync"
         Title="亿航Drive" Width="680" Height="720"
         Icon="app.ico"
         WindowStartupLocation="CenterScreen"
@@ -8,6 +9,9 @@
         Background="#F5F7FA"
         Closing="Window_Closing">
     <Window.Resources>
+        <!-- 空字符串隐藏转换器 -->
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+        <local:StringToVisibilityConverter x:Key="StringToVisibility"/>
         <!-- 进度条状态颜色转换 -->
         <Style x:Key="TransferProgress" TargetType="ProgressBar">
             <Setter Property="Height" Value="14"/>
@@ -69,6 +73,9 @@
                                                              Style="{StaticResource TransferProgress}"
                                                              Foreground="{Binding StatusColor}"
                                                              Margin="0,3,0,0"/>
+                                                <TextBlock Text="{Binding Speed}" FontSize="10"
+                                                           Foreground="#999" Margin="0,2,0,0"
+                                                           Visibility="{Binding Speed, Converter={StaticResource StringToVisibility}}"/>
                                             </StackPanel>
                                             <TextBlock Grid.Column="2" Text="{Binding ProgressText}"
                                                        FontSize="11" Foreground="#666"

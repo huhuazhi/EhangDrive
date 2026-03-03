@@ -434,6 +434,19 @@ public sealed class SyncProviderConnection : IDisposable
             CfReportProviderProgress(connectionKey, transferKey, fileSize, requiredOffset);
             SyncStatusManager.Instance.AddLog("⬇️", $"水合下载: {relativePath} ({FormatSize(requiredLength)})");
 
+            // 在 UI 传输列表中显示下载进度
+            var transferItem = new TransferItem
+            {
+                FileName = relativePath,
+                Direction = TransferDirection.Download,
+                Status = TransferStatus.Transferring,
+            };
+            SyncStatusManager.Instance.AddTransfer(transferItem);
+            var downloadStart = DateTime.UtcNow;
+
+            try // 确保 EndBusy 与 AddTransfer 的 BeginBusy 配对
+            {
+
             // ── 流式分块下载 + 逐块 TRANSFER_DATA ──
             const int CHUNK_SIZE = 4 * 1024 * 1024; // 4MB per chunk
 
@@ -494,6 +507,7 @@ public sealed class SyncProviderConnection : IDisposable
                         if (hr < 0)
                         {
                             FileLogger.Log($"  CfExecute(TRANSFER_DATA) 取消/失败: 0x{(uint)hr:X8} at offset={currentOffset}, 已传输 {totalRead} bytes");
+                            transferItem.Status = TransferStatus.Failed;
                             // 立即取消 HTTP 请求，避免 response.Dispose() 排空剩余数据阻塞回调线程
                             cts.Cancel();
                             return;
@@ -507,11 +521,19 @@ public sealed class SyncProviderConnection : IDisposable
                     currentOffset += bytesInChunk;
                     totalRead += bytesInChunk;
 
-                    // 更新进度
+                    // 更新 UI 进度和速度
+                    double pct = requiredLength > 0 ? totalRead * 100.0 / requiredLength : 0;
+                    transferItem.Progress = pct;
+                    transferItem.Speed = FormatTransferSpeed(totalRead, requiredLength, downloadStart);
+
+                    // 更新系统进度
                     CfReportProviderProgress(connectionKey, transferKey, fileSize, currentOffset);
                 }
 
                 FileLogger.Log($"  已下载: {relativePath} ({totalRead} bytes, {(totalRead + CHUNK_SIZE - 1) / CHUNK_SIZE} chunks)");
+                transferItem.Progress = 100;
+                transferItem.Status = TransferStatus.Completed;
+                transferItem.Speed = FormatSize(totalRead);
                 SyncStatusManager.Instance.AddLog("✅", $"已水合: {relativePath} ({FormatSize(totalRead)})");
 
                 // 下载完成后立即刷新抑制窗口，防止最后一个 chunk 触发的 Changed 事件竞态
@@ -525,12 +547,14 @@ public sealed class SyncProviderConnection : IDisposable
             catch (OperationCanceledException)
             {
                 FileLogger.Log($"  下载已取消: {relativePath}");
+                transferItem.Status = TransferStatus.Failed;
                 SyncStatusManager.Instance.AddLog("❌", $"下载已取消: {relativePath}");
                 return;
             }
             catch (Exception ex)
             {
                 FileLogger.Log($"  流式下载失败: {ex.Message}");
+                transferItem.Status = TransferStatus.Failed;
                 SyncStatusManager.Instance.AddLog("❌", $"下载失败: {relativePath}");
                 cts.Cancel(); // 确保 HTTP 请求被中止
                 TransferDataFailure(connectionKey, transferKey);
@@ -547,6 +571,12 @@ public sealed class SyncProviderConnection : IDisposable
                 var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
                 _syncEngine.SuppressForModList(fullPath);
                 _syncEngine.SetInSyncAfterHydration(fullPath);
+            }
+
+            } // end try (EndBusy)
+            finally
+            {
+                TrayIconService.Current?.EndBusy();
             }
         }
         catch (Exception ex)
@@ -675,5 +705,28 @@ public sealed class SyncProviderConnection : IDisposable
         if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
         if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024):F1} MB";
         return $"{bytes / (1024.0 * 1024 * 1024):F2} GB";
+    }
+
+    /// <summary>
+    /// 格式化传输速度和剩余时间
+    /// </summary>
+    private static string FormatTransferSpeed(long transferred, long total, DateTime startTime)
+    {
+        var elapsed = (DateTime.UtcNow - startTime).TotalSeconds;
+        if (elapsed < 0.5 || transferred <= 0) return FormatSize(total);
+
+        double speed = transferred / elapsed;
+        long remaining = total - transferred;
+        double eta = speed > 0 ? remaining / speed : 0;
+
+        string speedStr;
+        if (speed >= 1024 * 1024) speedStr = $"{speed / 1024 / 1024:F1} MB/s";
+        else if (speed >= 1024) speedStr = $"{speed / 1024:F0} KB/s";
+        else speedStr = $"{speed:F0} B/s";
+
+        if (eta < 1) return speedStr;
+        if (eta < 60) return $"{speedStr} · 剩余 {eta:F0}s";
+        if (eta < 3600) return $"{speedStr} · 剩余 {(int)(eta / 60)}:{(int)(eta % 60):D2}";
+        return $"{speedStr} · 剩余 {(int)(eta / 3600)}:{(int)(eta % 3600 / 60):D2}:{(int)(eta % 60):D2}";
     }
 }

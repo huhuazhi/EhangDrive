@@ -270,3 +270,23 @@ public partial class MainWindow : Window
         }
     }
 }
+
+/// <summary>
+/// 字符串为空时隐藏控件的转换器
+/// </summary>
+public class StringToVisibilityConverter : System.Windows.Data.IValueConverter
+{
+    public object Convert(object value, Type targetType, object parameter,
+        System.Globalization.CultureInfo culture)
+    {
+        return string.IsNullOrEmpty(value as string)
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+    }
+
+    public object ConvertBack(object value, Type targetType, object parameter,
+        System.Globalization.CultureInfo culture)
+    {
+        throw new NotImplementedException();
+    }
+}
