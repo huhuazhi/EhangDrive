@@ -44,6 +44,11 @@
                                 <TextBlock x:Name="TxtPendingCount" FontSize="13"
                                            Foreground="#888" Margin="8,0,0,0"/>
                             </StackPanel>
+                            <Button x:Name="BtnRetryAll" DockPanel.Dock="Bottom"
+                                    Content="↻ 重试全部失败项" Height="28" FontSize="12"
+                                    Background="#E74C3C" Foreground="White" BorderThickness="0"
+                                    Cursor="Hand" Margin="0,6,0,0" Visibility="Collapsed"
+                                    Click="BtnRetryAll_Click"/>
                             <ListView x:Name="LvTransfers" BorderThickness="0"
                                       Background="Transparent"
                                       ScrollViewer.HorizontalScrollBarVisibility="Disabled">
@@ -62,6 +67,7 @@
                                                 <ColumnDefinition Width="*"/>
                                                 <ColumnDefinition Width="60"/>
                                                 <ColumnDefinition Width="70"/>
+                                                <ColumnDefinition Width="Auto"/>
                                             </Grid.ColumnDefinitions>
                                             <TextBlock Grid.Column="0" Text="{Binding DirectionText}"
                                                        FontSize="12" Foreground="{Binding DirectionColor}"
@@ -85,6 +91,13 @@
                                                        FontSize="11" Foreground="{Binding StatusColor}"
                                                        VerticalAlignment="Center"
                                                        HorizontalAlignment="Right"/>
+                                            <Button Grid.Column="4" Content="重试" FontSize="11"
+                                                    Cursor="Hand" Width="40" Height="20"
+                                                    Margin="4,0,0,0"
+                                                    Background="#E74C3C" Foreground="White"
+                                                    BorderThickness="0"
+                                                    Visibility="{Binding RetryVisibility}"
+                                                    Click="BtnRetry_Click"/>
                                         </Grid>
                                     </DataTemplate>
                                 </ListView.ItemTemplate>

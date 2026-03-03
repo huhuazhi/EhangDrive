@@ -15,6 +15,9 @@ public class TransferItem : INotifyPropertyChanged
     private string _speed = "";
     private TransferStatus _status;
 
+    /// <summary>文件完整路径，用于重试上传</summary>
+    public string FullPath { get; set; } = "";
+
     public string FileName
     {
         get => _fileName;
@@ -50,8 +53,11 @@ public class TransferItem : INotifyPropertyChanged
     public TransferStatus Status
     {
         get => _status;
-        set { _status = value; OnPropertyChanged(); OnPropertyChanged(nameof(StatusText)); OnPropertyChanged(nameof(StatusColor)); }
+        set { _status = value; OnPropertyChanged(); OnPropertyChanged(nameof(StatusText)); OnPropertyChanged(nameof(StatusColor)); OnPropertyChanged(nameof(RetryVisibility)); }
     }
+
+    /// <summary>失败时显示重试按钮</summary>
+    public string RetryVisibility => Status == TransferStatus.Failed ? "Visible" : "Collapsed";
 
     /// <summary>进度条/状态颜色：上传用红+橘、下载用蓝+绿，失败统一灰色</summary>
     public string StatusColor => (Direction, Status) switch

@@ -520,6 +520,34 @@ public sealed class SyncEngine : IDisposable
     }
 
     /// <summary>
+    /// 重试单个失败的上传任务（从 UI 调用）
+    /// </summary>
+    public async Task RetryUploadAsync(TransferItem item)
+    {
+        if (item.Status != TransferStatus.Failed || item.Direction != TransferDirection.Upload)
+            return;
+
+        SyncStatusManager.Instance.RemoveTransfer(item);
+        await Task.Run(() => UploadFileWithRetry(item.FullPath, item.FileName));
+    }
+
+    /// <summary>
+    /// 重试所有失败的上传任务
+    /// </summary>
+    public async Task RetryAllFailedAsync()
+    {
+        var failedItems = SyncStatusManager.Instance.Transfers
+            .Where(t => t.Status == TransferStatus.Failed && t.Direction == TransferDirection.Upload)
+            .ToList();
+
+        foreach (var item in failedItems)
+            SyncStatusManager.Instance.RemoveTransfer(item);
+
+        foreach (var item in failedItems)
+            _ = Task.Run(() => UploadFileWithRetry(item.FullPath, item.FileName));
+    }
+
+    /// <summary>
     /// 等待文件可读后上传，最多重试 5 次
     /// </summary>
     /// <param name="forceUpload">为 true 时跳过 placeholder 检查（rename fallback 场景）</param>
@@ -536,6 +564,7 @@ public sealed class SyncEngine : IDisposable
         var transferItem = new TransferItem
         {
             FileName = relativePath,
+            FullPath = fullPath,
             Direction = TransferDirection.Upload,
             Status = TransferStatus.Waiting,
         };

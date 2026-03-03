@@ -80,6 +80,11 @@ public partial class MainWindow : Window
             {
                 _idleSeconds = 0;
             }
+
+            // 自动显示/隐藏"重试全部"按钮
+            bool hasFailed = SyncStatusManager.Instance.Transfers
+                .Any(t => t.Status == TransferStatus.Failed && t.Direction == TransferDirection.Upload);
+            BtnRetryAll.Visibility = hasFailed ? Visibility.Visible : Visibility.Collapsed;
         };
         timer.Start();
 
@@ -155,6 +160,22 @@ public partial class MainWindow : Window
             MessageBox.Show("删除失败，请重试。", "亿航Drive",
                 MessageBoxButton.OK, MessageBoxImage.Warning);
         }
+    }
+
+    // ─── 重试失败上传 ────────────────────────────────────────────
+    private async void BtnRetry_Click(object sender, RoutedEventArgs e)
+    {
+        if (_syncEngine == null) return;
+        if (sender is not System.Windows.Controls.Button btn || btn.DataContext is not TransferItem item) return;
+        await _syncEngine.RetryUploadAsync(item);
+    }
+
+    private async void BtnRetryAll_Click(object sender, RoutedEventArgs e)
+    {
+        if (_syncEngine == null) return;
+        BtnRetryAll.IsEnabled = false;
+        await _syncEngine.RetryAllFailedAsync();
+        BtnRetryAll.IsEnabled = true;
     }
 
     // ─── 窗口关闭 → 最小化到托盘，不退出 ─────────────────────────
