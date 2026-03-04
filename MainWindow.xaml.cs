@@ -102,6 +102,7 @@ public partial class MainWindow : Window
         TxtSettingUsername.Text = _config.Username;
         TxtSettingSyncFolder.Text = _config.SyncFolder ?? "";
         ChkAutoLogin.IsChecked = _config.AutoLogin;
+        ChkStartMinimized.IsChecked = _config.StartMinimized;
         ChkAutoStart.IsChecked = IsAutoStartEnabled();
     }
 
@@ -261,6 +262,12 @@ public partial class MainWindow : Window
     private void ChkAutoLoginSetting_Changed(object sender, RoutedEventArgs e)
     {
         _config.AutoLogin = ChkAutoLogin.IsChecked == true;
+        ConfigService.Save(_config);
+    }
+
+    private void ChkStartMinimized_Changed(object sender, RoutedEventArgs e)
+    {
+        _config.StartMinimized = ChkStartMinimized.IsChecked == true;
         ConfigService.Save(_config);
     }
 

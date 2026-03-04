@@ -279,9 +279,13 @@
                                           Checked="ChkAutoStart_Changed"
                                           Unchecked="ChkAutoStart_Changed"/>
                                 <CheckBox x:Name="ChkAutoLogin" Content="自动登录"
-                                          FontSize="13" Margin="0,0,0,4"
+                                          FontSize="13" Margin="0,0,0,8"
                                           Checked="ChkAutoLoginSetting_Changed"
                                           Unchecked="ChkAutoLoginSetting_Changed"/>
+                                <CheckBox x:Name="ChkStartMinimized" Content="自动登录时最小化到托盘"
+                                          FontSize="13" Margin="0,0,0,4"
+                                          Checked="ChkStartMinimized_Changed"
+                                          Unchecked="ChkStartMinimized_Changed"/>
                             </StackPanel>
                         </Border>
 

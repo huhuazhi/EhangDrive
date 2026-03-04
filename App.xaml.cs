@@ -86,6 +86,7 @@ public partial class App : Application
             Username = username!,
             Token = token!,
             AutoLogin = autoLogin,
+            StartMinimized = config?.StartMinimized ?? false,
             SyncFolder = config?.SyncFolder,
         };
 
@@ -172,7 +173,16 @@ public partial class App : Application
                 _mainWindow?.ExitApplication();
             });
 
-        _mainWindow.Show();
+        // 自动登录 + 启动时最小化 → 不显示窗口，只保留托盘图标
+        if (autoLogin && newConfig.StartMinimized)
+        {
+            FileLogger.Log("自动登录+最小化到托盘，不显示主窗口");
+            // 不调用 Show()，窗口保持隐藏
+        }
+        else
+        {
+            _mainWindow.Show();
+        }
 
         // ──── 首次全量同步（如果尚未完成）──────────────────────
         bool initialSyncDone = InitialSyncService.IsCompleted(newConfig.SyncFolder);
