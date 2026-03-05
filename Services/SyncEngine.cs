@@ -210,6 +210,68 @@ public sealed class SyncEngine : IDisposable
         return false;
     }
 
+    // ── 0x8007016B 元数据损坏修复 ──
+    private const int HR_CLOUD_FILE_METADATA_CORRUPT = unchecked((int)0x8007016B);
+
+    /// <summary>
+    /// 检查 IOException 是否为 Cloud File 元数据损坏 (0x8007016B)
+    /// </summary>
+    public static bool IsMetadataCorrupt(Exception ex)
+        => ex is IOException io && io.HResult == HR_CLOUD_FILE_METADATA_CORRUPT;
+
+    /// <summary>
+    /// 强制删除元数据损坏的 Cloud Filter placeholder。
+    /// 通过管理员权限临时 detach cldflt mini-filter 来绕过元数据校验。
+    /// </summary>
+    public static bool ForceDeleteCorruptPlaceholder(string fullPath)
+    {
+        try
+        {
+            var volume = Path.GetPathRoot(fullPath)?.TrimEnd('\\') ?? "C:";
+            var isDir = Directory.Exists(fullPath);
+
+            // 构造 PowerShell 命令：detach → 删除 → attach
+            var deleteCmd = isDir
+                ? $"Remove-Item -LiteralPath '{fullPath}' -Recurse -Force -ErrorAction Stop"
+                : $"Remove-Item -LiteralPath '{fullPath}' -Force -ErrorAction Stop";
+
+            var psScript = string.Join("; ",
+                $"fltmc detach cldflt {volume} 2>$null",
+                "Start-Sleep -Milliseconds 200",
+                deleteCmd,
+                $"fltmc attach cldflt {volume} 2>$null");
+
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = $"-NoProfile -ExecutionPolicy Bypass -Command \"{psScript}\"",
+                Verb = "runas",
+                UseShellExecute = true,
+                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
+                CreateNoWindow = true,
+            };
+
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) return false;
+            proc.WaitForExit(15000);
+
+            var deleted = !File.Exists(fullPath) && !Directory.Exists(fullPath);
+            FileLogger.Log($"ForceDeleteCorrupt: {(deleted ? "成功" : "失败")} - {fullPath}");
+            return deleted;
+        }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            // 用户拒绝 UAC 提升
+            FileLogger.Log($"ForceDeleteCorrupt: 用户拒绝提升权限 - {fullPath}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"ForceDeleteCorrupt: 异常 - {fullPath}: {ex.Message}");
+            return false;
+        }
+    }
+
     /// <summary>
     /// 检查路径是否在最近被同步处理过（用于过滤反馈事件）
     /// </summary>
@@ -769,6 +831,8 @@ public sealed class SyncEngine : IDisposable
                             catch (Exception ex)
                             {
                                 FileLogger.Log($"  [DeferredCleanup] 删除失败: {relativePath} - {ex.Message}");
+                                if (IsMetadataCorrupt(ex))
+                                    ForceDeleteCorruptPlaceholder(dir);
                                 break;
                             }
                         }
@@ -776,6 +840,8 @@ public sealed class SyncEngine : IDisposable
                     catch (Exception ex)
                     {
                         FileLogger.Log($"  [DeferredCleanup] 处理目录异常: {dir} - {ex.Message}");
+                        if (IsMetadataCorrupt(ex))
+                            ForceDeleteCorruptPlaceholder(dir);
                     }
                 }
 

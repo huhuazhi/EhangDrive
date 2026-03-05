@@ -125,6 +125,11 @@ public sealed class ModListPollingService : IDisposable
             catch (Exception ex)
             {
                 FileLogger.Log($"ModList: 删除本地文件失败: {item.Path} - {ex.Message}");
+                if (SyncEngine.IsMetadataCorrupt(ex))
+                {
+                    FileLogger.Log($"ModList: 尝试强制删除损坏的 placeholder: {item.Path}");
+                    SyncEngine.ForceDeleteCorruptPlaceholder(localPath);
+                }
             }
         }
         else if (Directory.Exists(localPath))
@@ -142,6 +147,11 @@ public sealed class ModListPollingService : IDisposable
             catch (Exception ex)
             {
                 FileLogger.Log($"ModList: 删除本地目录失败: {item.Path} - {ex.Message}");
+                if (SyncEngine.IsMetadataCorrupt(ex))
+                {
+                    FileLogger.Log($"ModList: 尝试强制删除损坏的目录: {item.Path}");
+                    SyncEngine.ForceDeleteCorruptPlaceholder(localPath);
+                }
             }
         }
         return Task.CompletedTask;
