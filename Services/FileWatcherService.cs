@@ -1,4 +1,5 @@
 using System.IO;
+using EhangNAS_Sync.Models;
 
 namespace EhangNAS_Sync.Services;
 
@@ -252,14 +253,19 @@ public sealed class FileWatcherService : IDisposable
 
     /// <summary>
     /// FileSystemWatcher 缓冲区溢出或内部错误。
-    /// 大量文件/目录同时删除时 256KB 缓冲区仍可能不够，
-    /// 此时部分 Deleted 事件丢失。HandleDelete 的 CleanupEmptyParentDirs
-    /// 会在子项删除后自动向上清理空的占位符目录，弥补丢失的事件。
+    /// 缓冲区溢出时部分事件会丢失（解压大量文件时常见），
+    /// 触发全量扫描补偿，将未同步的文件/目录重新入队。
     /// </summary>
     private void OnError(object sender, ErrorEventArgs e)
     {
         FileLogger.Log($"FileWatcher.Error: {e.GetException().Message}");
-        FileLogger.Log($"  可能有文件系统事件丢失，空占位符目录将在子项删除时自动清理");
+
+        if (e.GetException() is InternalBufferOverflowException)
+        {
+            FileLogger.Log("  FileSystemWatcher 缓冲区溢出，启动全量扫描补偿...");
+            SyncStatusManager.Instance.AddLog("⚠️", "文件系统事件缓冲区溢出，启动补偿扫描");
+            _engine.EnqueueFullScan();
+        }
     }
 
     public void Dispose()

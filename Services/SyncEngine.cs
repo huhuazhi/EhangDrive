@@ -62,6 +62,9 @@ public sealed class SyncEngine : IDisposable
     private readonly ConcurrentDictionary<string, byte> _dirtyDirectories = new(StringComparer.OrdinalIgnoreCase);
     public bool HasDirtyDirectories => !_dirtyDirectories.IsEmpty;
 
+    // 全量扫描防并发：0=空闲, 1=扫描排队或进行中
+    private int _scanPending;
+
     // ModList 操作抑制：ModList 删除/脱水本地文件时，抑制 FileWatcher 产生的 Delete/Changed 事件
     // key=fullPath, value=ticks
     private readonly ConcurrentDictionary<string, long> _modListSuppressed = new(StringComparer.OrdinalIgnoreCase);
@@ -1121,6 +1124,74 @@ public sealed class SyncEngine : IDisposable
         uint dwCreationDisposition,
         uint dwFlagsAndAttributes,
         IntPtr hTemplateFile);
+
+    /// <summary>
+    /// FileSystemWatcher 缓冲区溢出时调用：延迟后全量扫描，补偿丢失的事件。
+    /// 扫描只对"非 placeholder"的文件/目录入队，已同步的 placeholder 自动跳过。
+    /// </summary>
+    public void EnqueueFullScan()
+    {
+        // 防止多次连续溢出触发多次并发扫描
+        if (Interlocked.CompareExchange(ref _scanPending, 1, 0) != 0)
+        {
+            FileLogger.Log("全量扫描: 已有扫描在排队/进行中，跳过");
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // 等待 5 秒，让正在进行的解压/创建操作以及当前队列尽量处理完
+                FileLogger.Log("全量扫描: 等待 5 秒后开始...");
+                await Task.Delay(5000);
+
+                FileLogger.Log("全量扫描: 开始扫描未同步的文件/目录...");
+                int fileCount = 0, dirCount = 0;
+                var syncDi = new DirectoryInfo(_syncFolder);
+
+                foreach (var entry in syncDi.EnumerateFileSystemInfos("*", new EnumerationOptions
+                {
+                    RecurseSubdirectories = true,
+                    IgnoreInaccessible = true,
+                    AttributesToSkip = 0, // 不跳过任何属性
+                }))
+                {
+                    // 跳过已是 placeholder 的项（Cloud Filter 已管理）
+                    if (entry.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                        continue;
+
+                    var relativePath = Path.GetRelativePath(_syncFolder, entry.FullName)
+                                           .Replace('\\', '/');
+
+                    if (ShouldSkipPath(relativePath)) continue;
+
+                    if (entry is DirectoryInfo)
+                    {
+                        dirCount++;
+                        Enqueue(new SyncEvent(SyncEventType.CreateDirectory, entry.FullName, relativePath));
+                    }
+                    else if (entry is FileInfo)
+                    {
+                        fileCount++;
+                        Enqueue(new SyncEvent(SyncEventType.CreateFile, entry.FullName, relativePath));
+                    }
+                }
+
+                FileLogger.Log($"全量扫描完成: 发现 {fileCount} 个未同步文件, {dirCount} 个未同步目录");
+                if (fileCount + dirCount > 0)
+                    SyncStatusManager.Instance.AddLog("🔍", $"缓冲区溢出补偿: 发现 {fileCount} 个文件 + {dirCount} 个目录");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log($"全量扫描异常: {ex.Message}");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _scanPending, 0);
+            }
+        });
+    }
 
     public void Dispose()
     {
