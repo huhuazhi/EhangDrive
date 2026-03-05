@@ -593,6 +593,11 @@ public sealed class SyncEngine : IDisposable
                 if (!ok)
                     FileLogger.Log($"  服务端删除空目录失败(将继续清理本地): {relativePath}");
 
+                // 标记父目录为 RecentlySynced，防止删除触发父 Changed → UNPINNED 误脱水
+                var parentOfCleanup = Path.GetDirectoryName(dir);
+                if (!string.IsNullOrEmpty(parentOfCleanup) && parentOfCleanup.Length > _syncFolder.Length)
+                    _recentlySynced[parentOfCleanup] = DateTime.UtcNow.Ticks;
+
                 // 删本地（本地已确认是空的 ReparsePoint 占位符目录）
                 try { Directory.Delete(dir); }
                 catch (Exception ex)

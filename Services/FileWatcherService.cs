@@ -218,6 +218,12 @@ public sealed class FileWatcherService : IDisposable
             SyncEventType.DeleteItem,
             e.FullPath,
             relativePath));
+
+        // 标记父目录为 RecentlySynced，防止子项删除触发父目录 Changed 事件时
+        // 对 UNPINNED 父目录执行误脱水（如删除子目录导致 .7z 被脱水再水合）
+        var parentDir = Path.GetDirectoryName(e.FullPath);
+        if (!string.IsNullOrEmpty(parentDir) && parentDir.Length > _syncFolder.Length)
+            _engine.MarkRecentlySynced(parentDir);
     }
 
     private void OnRenamed(object sender, RenamedEventArgs e)
