@@ -426,21 +426,46 @@ public class SyncApiService
     /// </summary>
     public async Task<bool> DeleteAsync(string relativePath)
     {
-        try
+        const int maxRetries = 3;
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
         {
-            var url = $"{_baseUrl}/delete";
-            var payload = JsonSerializer.Serialize(new { path = relativePath, client_id = _clientId });
-            FileLogger.Log($"DeleteAsync: POST {url} (path={relativePath})");
-            var content = new StringContent(payload, Encoding.UTF8, "application/json");
-            var response = await _http.PostAsync(url, content);
-            FileLogger.Log($"  HTTP {(int)response.StatusCode}");
-            return response.IsSuccessStatusCode;
+            try
+            {
+                var url = $"{_baseUrl}/delete";
+                var payload = JsonSerializer.Serialize(new { path = relativePath, client_id = _clientId });
+                if (attempt == 1)
+                    FileLogger.Log($"DeleteAsync: POST {url} (path={relativePath})");
+                else
+                    FileLogger.Log($"DeleteAsync: 重试 {attempt}/{maxRetries} (path={relativePath})");
+                var content = new StringContent(payload, Encoding.UTF8, "application/json");
+                var response = await _http.PostAsync(url, content);
+                var code = (int)response.StatusCode;
+                FileLogger.Log($"  HTTP {code}");
+
+                // 2xx = 成功, 404 = 服务端已无此路径 = 等效成功
+                if (response.IsSuccessStatusCode || code == 404)
+                    return true;
+
+                // 500 等服务端错误：重试
+                if (code >= 500 && attempt < maxRetries)
+                {
+                    await Task.Delay(500 * attempt);
+                    continue;
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log($"  DeleteAsync 异常: {ex.Message}");
+                if (attempt < maxRetries)
+                {
+                    await Task.Delay(500 * attempt);
+                    continue;
+                }
+                return false;
+            }
         }
-        catch (Exception ex)
-        {
-            FileLogger.Log($"  DeleteAsync 异常: {ex.Message}");
-            return false;
-        }
+        return false;
     }
 
     /// <summary>

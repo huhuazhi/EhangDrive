@@ -554,14 +554,13 @@ public sealed class SyncEngine : IDisposable
                         {
                             var subRel = Path.GetRelativePath(_syncFolder, sub.FullName).Replace('\\', '/');
                             FileLogger.Log($"  清理空占位符兄弟目录: {subRel}");
-                            var subOk = await _api.DeleteAsync(subRel);
-                            if (subOk)
+                            // 尝试删服务端（不阻塞本地清理）
+                            await _api.DeleteAsync(subRel);
+                            // 本地确认是空 placeholder，直接删
+                            try { sub.Delete(); }
+                            catch (Exception ex)
                             {
-                                try { sub.Delete(); }
-                                catch (Exception ex)
-                                {
-                                    FileLogger.Log($"  删除本地兄弟目录失败: {subRel} - {ex.Message}");
-                                }
+                                FileLogger.Log($"  删除本地兄弟目录失败: {subRel} - {ex.Message}");
                             }
                         }
                     }
@@ -573,24 +572,19 @@ public sealed class SyncEngine : IDisposable
                 var relativePath = Path.GetRelativePath(_syncFolder, dir).Replace('\\', '/');
                 FileLogger.Log($"  清理空占位符父目录: {relativePath}");
 
-                // 先删服务端
+                // 先尝试删服务端（即使失败也继续删本地空 placeholder）
                 var ok = await _api.DeleteAsync(relativePath);
-                if (ok)
+                if (!ok)
+                    FileLogger.Log($"  服务端删除空目录失败(将继续清理本地): {relativePath}");
+
+                // 删本地（本地已确认是空的 ReparsePoint 占位符目录）
+                try { Directory.Delete(dir); }
+                catch (Exception ex)
                 {
-                    // 再删本地
-                    try { Directory.Delete(dir); }
-                    catch (Exception ex)
-                    {
-                        FileLogger.Log($"  删除本地空目录失败: {relativePath} - {ex.Message}");
-                        break;
-                    }
-                    SyncStatusManager.Instance.AddLog("✅", $"清理空目录: {relativePath}");
-                }
-                else
-                {
-                    FileLogger.Log($"  服务端删除空目录失败: {relativePath}");
+                    FileLogger.Log($"  删除本地空目录失败: {relativePath} - {ex.Message}");
                     break;
                 }
+                SyncStatusManager.Instance.AddLog("✅", $"清理空目录: {relativePath}");
 
                 // 继续向上检查
                 dir = Path.GetDirectoryName(dir);
