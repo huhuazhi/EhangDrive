@@ -341,6 +341,13 @@ public sealed class SyncProviderConnection : IDisposable
 
                 if (isDir)
                 {
+                    // 爆发检测：目录级脱水，如果该目录树已超阈值则跳过（批量删除场景）
+                    if (_syncEngine?.RecordDehydrateAndCheckSuppressed(fullPath) == true)
+                    {
+                        FileLogger.Log($"DEHYDRATE: 跳过(删除爆发抑制): {fullPath}");
+                        return true;
+                    }
+
                     // 目录：递归释放所有已 hydrated 文件
                     FileLogger.Log($"DEHYDRATE: UNPINNED 目录检测到，释放空间: {fullPath}");
                     int count = 0;
@@ -373,7 +380,13 @@ public sealed class SyncProviderConnection : IDisposable
                 }
                 else
                 {
-                    // 单个文件
+                    // 单个文件：爆发检测
+                    if (_syncEngine?.RecordDehydrateAndCheckSuppressed(fullPath) == true)
+                    {
+                        FileLogger.Log($"DEHYDRATE: 跳过(删除爆发抑制): {fullPath}");
+                        return true;
+                    }
+
                     var fi = new FileInfo(fullPath);
                     if (fi.Attributes.HasFlag(FileAttributes.Offline)) return true; // 已 dehydrated
                     if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) return false; // 不是 placeholder
@@ -613,11 +626,37 @@ public sealed class SyncProviderConnection : IDisposable
             string relativePath = GetRelativePath(normalizedPath);
             FileLogger.Log($"  relativePath=\"{relativePath}\"");
 
-            // 在写入数据之前就标记抑制，防止 Changed 事件竞态
-            // 同时设置 SuppressForModList，因为大文件下载可能超过 MarkRecentlySynced 的 2 秒窗口
+            // 检查是否位于被抑制的删除目录树下 — 文件即将被删，不需要下载
             if (_syncEngine != null && _syncFolder != null)
             {
                 var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
+                if (_syncEngine.IsInSuppressedTree(fullPath))
+                {
+                    FileLogger.Log($"  FETCH_DATA 跳过(删除爆发抑制): {relativePath}");
+                    // 返回错误状态让 Windows 知道不提供数据
+                    var cancelOpInfo = new CF_OPERATION_INFO
+                    {
+                        StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
+                        Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
+                        ConnectionKey = connectionKey,
+                        TransferKey = transferKey,
+                        SyncStatus = IntPtr.Zero,
+                        RequestKey = requestKey,
+                    };
+                    var cancelOpParams = new CF_OPERATION_PARAMETERS_TRANSFERDATA
+                    {
+                        ParamSize = (uint)Marshal.SizeOf<CF_OPERATION_PARAMETERS_TRANSFERDATA>(),
+                        CompletionStatus = unchecked((int)0xC000_0120), // STATUS_CANCELLED
+                        Buffer = IntPtr.Zero,
+                        Offset = 0,
+                        Length = 0,
+                    };
+                    CfExecute(in cancelOpInfo, ref cancelOpParams);
+                    return;
+                }
+
+                // 在写入数据之前就标记抑制，防止 Changed 事件竞态
+                // 同时设置 SuppressForModList，因为大文件下载可能超过 MarkRecentlySynced 的 2 秒窗口
                 _syncEngine.MarkRecentlySynced(fullPath);
                 _syncEngine.SuppressForModList(fullPath);
             }

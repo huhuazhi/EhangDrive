@@ -69,6 +69,121 @@ public sealed class SyncEngine : IDisposable
     private readonly ConcurrentDictionary<string, byte> _pendingCleanupDirs = new(StringComparer.OrdinalIgnoreCase);
     private int _cleanupRunning; // 0=空闲, 1=运行中
 
+    // ── 删除目录树爆发抑制 ──
+    // 目录树下短时间内大量 DEHYDRATE 请求说明是批量删除，阻止后续一切无用操作
+    // key=目录路径（树根）, value=(计数, 首次时间ticks)
+    private readonly ConcurrentDictionary<string, (int count, long firstTicks)> _dehydrateBurst = new(StringComparer.OrdinalIgnoreCase);
+    // 已确认为正在删除的目录树前缀集合，key=fullPath前缀
+    private readonly ConcurrentDictionary<string, long> _suppressedTrees = new(StringComparer.OrdinalIgnoreCase);
+    private const int BURST_THRESHOLD = 5;     // 2秒内超过此数则判定为删除爆发
+    private const int BURST_WINDOW_MS = 2000;  // 爆发检测时间窗口
+    private const int SUPPRESS_DURATION_S = 60; // 抑制持续时间
+
+    /// <summary>
+    /// 记录一次 DEHYDRATE 事件，超过阈值时将父目录标记为 suppressedTree。
+    /// 由 SyncProviderConnection.TryHandleDehydrateRequest 调用。
+    /// </summary>
+    public bool RecordDehydrateAndCheckSuppressed(string fullPath)
+    {
+        // 提取最近的 3 级父目录作为 burst 跟踪 key（同一棵树下的文件聚合）
+        var dir = Path.GetDirectoryName(fullPath);
+        if (string.IsNullOrEmpty(dir)) return false;
+
+        // 向上找到最近未被 suppress 的目录，或直接使用当前目录
+        var trackDir = dir;
+        var nowTicks = DateTime.UtcNow.Ticks;
+
+        // 先检查是否已被抑制
+        if (IsInSuppressedTree(fullPath)) return true;
+
+        var entry = _dehydrateBurst.AddOrUpdate(
+            trackDir,
+            _ => (1, nowTicks),
+            (_, old) =>
+            {
+                if ((nowTicks - old.firstTicks) > TimeSpan.FromMilliseconds(BURST_WINDOW_MS).Ticks)
+                    return (1, nowTicks); // 窗口过期，重新计数
+                return (old.count + 1, old.firstTicks);
+            });
+
+        if (entry.count >= BURST_THRESHOLD)
+        {
+            // 找到更高的被删除树根：向上逐级检查哪些目录也有 burst
+            var treeRoot = trackDir;
+            var parent = Path.GetDirectoryName(trackDir);
+            while (!string.IsNullOrEmpty(parent)
+                   && !string.Equals(parent, _syncFolder, StringComparison.OrdinalIgnoreCase))
+            {
+                if (_dehydrateBurst.TryGetValue(parent, out var pEntry)
+                    && (nowTicks - pEntry.firstTicks) < TimeSpan.FromMilliseconds(BURST_WINDOW_MS).Ticks
+                    && pEntry.count >= 2)
+                {
+                    treeRoot = parent;
+                }
+                parent = Path.GetDirectoryName(parent);
+            }
+
+            _suppressedTrees[treeRoot] = nowTicks;
+            var rel = Path.GetRelativePath(_syncFolder, treeRoot).Replace('\\', '/');
+            FileLogger.Log($"[BurstDetect] 检测到删除爆发，抑制目录树: {rel} (已累计 {entry.count} 次DEHYDRATE)");
+            SyncStatusManager.Instance.AddLog("🛑", $"检测到批量删除，抑制: {rel}");
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 检查路径是否位于被抑制的目录树下。
+    /// FileWatcher 的所有事件入口和 FETCH_DATA 回调使用此方法过滤。
+    /// </summary>
+    public bool IsInSuppressedTree(string fullPath)
+    {
+        var nowTicks = DateTime.UtcNow.Ticks;
+        foreach (var kv in _suppressedTrees)
+        {
+            if ((nowTicks - kv.Value) > TimeSpan.FromSeconds(SUPPRESS_DURATION_S).Ticks)
+            {
+                _suppressedTrees.TryRemove(kv.Key, out _);
+                continue;
+            }
+            if (fullPath.StartsWith(kv.Key, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// HandleDelete 中 Deleted 事件到达时，主动将该目录树标记为 suppressed。
+    /// </summary>
+    public void MarkTreeSuppressed(string fullPath)
+    {
+        // 只标记目录（文件删除不需要标记树）
+        var dir = Path.GetDirectoryName(fullPath);
+        if (string.IsNullOrEmpty(dir)) return;
+
+        // 如果 dir 已经在 suppressedTrees 中就不需要再标
+        if (IsInSuppressedTree(dir)) return;
+
+        // 检测同一目录下是否有多个 pending delete（说明是目录树删除）
+        int count = 0;
+        foreach (var kv in _pendingDeletes)
+        {
+            var pd = Path.GetDirectoryName(Path.Combine(_syncFolder, kv.Key.Replace('/', '\\')));
+            if (!string.IsNullOrEmpty(pd) && pd.StartsWith(dir, StringComparison.OrdinalIgnoreCase))
+            {
+                count++;
+                if (count >= 3)
+                {
+                    _suppressedTrees[dir] = DateTime.UtcNow.Ticks;
+                    var rel = Path.GetRelativePath(_syncFolder, dir).Replace('\\', '/');
+                    FileLogger.Log($"[DeleteDetect] Deleted 事件确认目录树删除，抑制: {rel}");
+                    break;
+                }
+            }
+        }
+    }
+
     // ModList 操作抑制：ModList 删除/脱水本地文件时，抑制 FileWatcher 产生的 Delete/Changed 事件
     // key=fullPath, value=ticks
     private readonly ConcurrentDictionary<string, long> _modListSuppressed = new(StringComparer.OrdinalIgnoreCase);

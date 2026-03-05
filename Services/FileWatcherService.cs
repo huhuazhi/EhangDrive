@@ -47,6 +47,9 @@ public sealed class FileWatcherService : IDisposable
 
     private void OnCreated(object sender, FileSystemEventArgs e)
     {
+        // 被抑制的删除目录树下不处理任何 Created 事件
+        if (_engine.IsInSuppressedTree(e.FullPath)) return;
+
         FileLogger.Log($"FileWatcher.Created: {e.FullPath}");
 
         // 过滤 CfConvertToPlaceholder 触发的反馈事件
@@ -141,6 +144,9 @@ public sealed class FileWatcherService : IDisposable
 
     private void OnChanged(object sender, FileSystemEventArgs e)
     {
+        // 被抑制的删除目录树下不处理任何 Changed 事件（包括 DEHYDRATE）
+        if (_engine.IsInSuppressedTree(e.FullPath)) return;
+
         // 先过滤内部操作的反馈事件（CfConvertToPlaceholder / CfSetInSyncState / FETCH_DATA / FlushDirtyDirectories）
         // 必须在 TryHandleDehydrateRequest 之前！否则内部操作触发的 Changed 会对 UNPINNED 目录执行脱水，
         // 导致刚上传的文件被立即脱水（白云 bug）
@@ -201,6 +207,10 @@ public sealed class FileWatcherService : IDisposable
     private void OnDeleted(object sender, FileSystemEventArgs e)
     {
         FileLogger.Log($"FileWatcher.Deleted: {e.FullPath}");
+
+        // Deleted 事件到达时，尝试标记该目录树为抑制状态
+        // 这样后续的 Changed/Created 事件会被跳过
+        _engine.MarkTreeSuppressed(e.FullPath);
 
         // ModList 删除本地文件时不要级联删除服务端
         if (_engine.IsModListSuppressed(e.FullPath))
