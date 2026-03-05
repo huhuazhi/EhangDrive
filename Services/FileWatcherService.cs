@@ -78,6 +78,12 @@ public sealed class FileWatcherService : IDisposable
                 SyncEventType.CreateDirectory,
                 e.FullPath,
                 relativePath));
+
+            // 标记父目录为 RecentlySynced，防止子目录/文件创建触发父目录 Changed 时
+            // 对 UNPINNED 父目录执行误脱水（如 .7z 在解压时被反复脱水/水合）
+            var parentDir = Path.GetDirectoryName(e.FullPath);
+            if (!string.IsNullOrEmpty(parentDir) && parentDir.Length > _syncFolder.Length)
+                _engine.MarkRecentlySynced(parentDir);
         }
         else if (File.Exists(e.FullPath))
         {
@@ -124,23 +130,29 @@ public sealed class FileWatcherService : IDisposable
                 SyncEventType.CreateFile,
                 e.FullPath,
                 relativePath));
+
+            // 标记父目录为 RecentlySynced（同 CreateDirectory 的理由）
+            var parentDir2 = Path.GetDirectoryName(e.FullPath);
+            if (!string.IsNullOrEmpty(parentDir2) && parentDir2.Length > _syncFolder.Length)
+                _engine.MarkRecentlySynced(parentDir2);
         }
     }
 
     private void OnChanged(object sender, FileSystemEventArgs e)
     {
-        // 优先检查"释放空间"（PinState → UNPINNED）— 不受抑制窗口限制
-        // 用户可能在 Pin 水合刚完成后立即释放空间，此时 RecentlySynced/ModList 抑制仍活跃，
-        // 若不优先检查，Changed 事件会被吞掉导致脱水不执行（蓝圈 bug）
-        if (SyncProviderConnection.TryHandleDehydrateRequest(e.FullPath))
-            return;
-
-        // 过滤反馈事件（CfConvertToPlaceholder / CfSetInSyncState / FETCH_DATA 触发的属性变化）
+        // 先过滤内部操作的反馈事件（CfConvertToPlaceholder / CfSetInSyncState / FETCH_DATA / FlushDirtyDirectories）
+        // 必须在 TryHandleDehydrateRequest 之前！否则内部操作触发的 Changed 会对 UNPINNED 目录执行脱水，
+        // 导致刚上传的文件被立即脱水（白云 bug）
         if (_engine.IsRecentlySynced(e.FullPath))
         {
             FileLogger.Log($"FileWatcher.Changed 跳过(RecentlySynced): {e.FullPath}");
             return;
         }
+
+        // 检查"释放空间"（PinState → UNPINNED）
+        // 用户右键"释放空间"后 Windows 设置 PinState=UNPINNED，这里检测并主动脱水
+        if (SyncProviderConnection.TryHandleDehydrateRequest(e.FullPath))
+            return;
 
         // ModList 脱水操作引起的 Changed 不要重新上传
         if (_engine.IsModListSuppressed(e.FullPath))

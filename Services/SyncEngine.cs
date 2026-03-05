@@ -902,6 +902,10 @@ public sealed class SyncEngine : IDisposable
             // 通知 Explorer 刷新文件图标覆盖（解决蓝圈不自动变绿勾的问题）
             SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, fullPath);
 
+            // 标记所有父目录为 RecentlySynced，
+            // 防止 CfConvertToPlaceholder 触发的父目录 Changed 事件对 UNPINNED 目录误脱水
+            MarkParentRecentlySynced(fullPath);
+
             // 不论文件还是目录，转 placeholder 都会清除父目录的 IN_SYNC（变白云）
             // 记录脏父目录，等所有操作完成后由 FlushDirtyDirectories 统一批量设回 IN_SYNC
             MarkParentDirectoriesDirty(fullPath);
@@ -909,6 +913,22 @@ public sealed class SyncEngine : IDisposable
         catch (Exception ex)
         {
             FileLogger.Log($"  ConvertToPlaceholderAndSync 异常: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 标记所有父目录为 RecentlySynced，防止内部操作（CfConvertToPlaceholder / SHChangeNotify）
+    /// 触发的父目录 Changed 事件对 UNPINNED 目录执行误脱水
+    /// </summary>
+    private void MarkParentRecentlySynced(string fullPath)
+    {
+        var dir = Path.GetDirectoryName(fullPath);
+        while (!string.IsNullOrEmpty(dir) &&
+               dir.StartsWith(_syncFolder, StringComparison.OrdinalIgnoreCase) &&
+               dir.Length > _syncFolder.Length)
+        {
+            _recentlySynced[dir] = DateTime.UtcNow.Ticks;
+            dir = Path.GetDirectoryName(dir);
         }
     }
 
@@ -942,6 +962,11 @@ public sealed class SyncEngine : IDisposable
         dirs.Sort((a, b) => b.Length.CompareTo(a.Length));
 
         FileLogger.Log($"FlushDirtyDirectories: 刷新 {dirs.Count} 个目录的 IN_SYNC 状态");
+
+        // 预先标记所有待刷新的目录为 RecentlySynced，
+        // 防止 SHChangeNotify 触发 Changed → TryHandleDehydrateRequest → 对 UNPINNED 目录误脱水
+        foreach (var dir in dirs)
+            _recentlySynced[dir] = DateTime.UtcNow.Ticks;
 
         foreach (var dir in dirs)
         {
@@ -978,6 +1003,9 @@ public sealed class SyncEngine : IDisposable
                     IntPtr.Zero);
 
                 SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, dir);
+
+                // 刷新后再次标记，确保 SHChangeNotify 引起的延迟 Changed 事件也被抑制
+                _recentlySynced[dir] = DateTime.UtcNow.Ticks;
             }
             catch { }
         }
