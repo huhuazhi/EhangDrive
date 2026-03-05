@@ -223,6 +223,11 @@ public sealed class SyncProviderConnection : IDisposable
     }
 
     /// <summary>
+    /// 将文件/目录标记为 IN_SYNC（绿勾）— 公开版本，供外部调用
+    /// </summary>
+    public static void SetItemInSyncPublic(string path) => SetItemInSync(path);
+
+    /// <summary>
     /// 将文件/目录标记为 IN_SYNC（绿勾）
     /// </summary>
     private static void SetItemInSync(string path)

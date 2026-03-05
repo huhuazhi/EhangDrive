@@ -153,8 +153,25 @@ public sealed class FileWatcherService : IDisposable
         if (SyncProviderConnection.TryHandlePinRequest(e.FullPath))
             return;
 
-        // 只处理文件修改（目录的 Changed 忽略）
-        if (!File.Exists(e.FullPath) || Directory.Exists(e.FullPath)) return;
+        // 目录的 Changed 事件通常是属性变化（如 Windows 搜索设置 NotContentIndexed），
+        // 这类属性变化会清除 Cloud Filter 的 IN_SYNC 状态导致显示白云。
+        // 检测到 placeholder 目录变化时，重新设置 IN_SYNC。
+        if (Directory.Exists(e.FullPath))
+        {
+            try
+            {
+                var di = new DirectoryInfo(e.FullPath);
+                if (di.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
+                {
+                    SyncProviderConnection.SetItemInSyncPublic(e.FullPath);
+                }
+            }
+            catch { }
+            return;
+        }
+
+        // 只处理文件修改
+        if (!File.Exists(e.FullPath)) return;
 
         var relativePath = Path.GetRelativePath(_syncFolder, e.FullPath)
                                .Replace('\\', '/');
