@@ -476,6 +476,22 @@ public sealed class SyncEngine : IDisposable
                 return;
             }
 
+            // ── 祖先折叠：如果任何父目录也在待删队列，跳过子路径 ──
+            // 用户删除一个目录时，FileSystemWatcher 会为每个子文件/子目录单独产生 Deleted 事件。
+            // 只需对最顶层的目录发一次 DeleteAsync，子路径全部跳过。
+            {
+                var parts = evt.RelativePath.Split('/');
+                for (int i = parts.Length - 1; i > 0; i--)
+                {
+                    var ancestor = string.Join('/', parts, 0, i);
+                    if (_pendingDeletes.ContainsKey(ancestor))
+                    {
+                        FileLogger.Log($"  跳过删除(父目录待删): {evt.RelativePath}");
+                        return;
+                    }
+                }
+            }
+
             // 二次检查：本地是否又出现了
             if (File.Exists(pending.fullPath) || Directory.Exists(pending.fullPath))
             {
