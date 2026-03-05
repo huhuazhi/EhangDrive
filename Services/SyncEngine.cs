@@ -479,9 +479,27 @@ public sealed class SyncEngine : IDisposable
             // 二次检查：本地是否又出现了
             if (File.Exists(pending.fullPath) || Directory.Exists(pending.fullPath))
             {
-                FileLogger.Log($"  取消删除(路径已恢复): {evt.RelativePath}");
-                SyncStatusManager.Instance.AddLog("🔙", $"取消删除(已恢复): {evt.RelativePath}");
-                return;
+                // 空的 placeholder 目录（ReparsePoint）不算"恢复"，
+                // 大目录树删除时 Windows 会留下空的 Cloud Filter 占位符目录壳。
+                var isEmptyPlaceholderDir = false;
+                if (Directory.Exists(pending.fullPath))
+                {
+                    try
+                    {
+                        var di = new DirectoryInfo(pending.fullPath);
+                        isEmptyPlaceholderDir = di.Attributes.HasFlag(FileAttributes.ReparsePoint)
+                                                && !di.EnumerateFileSystemInfos().Any();
+                    }
+                    catch { /* 忽略 */ }
+                }
+
+                if (!isEmptyPlaceholderDir)
+                {
+                    FileLogger.Log($"  取消删除(路径已恢复): {evt.RelativePath}");
+                    SyncStatusManager.Instance.AddLog("🔙", $"取消删除(已恢复): {evt.RelativePath}");
+                    return;
+                }
+                FileLogger.Log($"  路径仍存在但是空的占位符目录，继续删除: {evt.RelativePath}");
             }
 
             // 执行服务端删除
@@ -525,7 +543,32 @@ public sealed class SyncEngine : IDisposable
 
                 // 只清理空的占位符目录（ReparsePoint = Cloud Filter placeholder）
                 if (!di.Attributes.HasFlag(FileAttributes.ReparsePoint)) break;
-                if (di.EnumerateFileSystemInfos().Any()) break; // 非空，停止
+
+                // 先清理该目录下所有空的 placeholder 子目录（兄弟节点可能遗留）
+                foreach (var sub in di.EnumerateDirectories())
+                {
+                    try
+                    {
+                        if (sub.Attributes.HasFlag(FileAttributes.ReparsePoint)
+                            && !sub.EnumerateFileSystemInfos().Any())
+                        {
+                            var subRel = Path.GetRelativePath(_syncFolder, sub.FullName).Replace('\\', '/');
+                            FileLogger.Log($"  清理空占位符兄弟目录: {subRel}");
+                            var subOk = await _api.DeleteAsync(subRel);
+                            if (subOk)
+                            {
+                                try { sub.Delete(); }
+                                catch (Exception ex)
+                                {
+                                    FileLogger.Log($"  删除本地兄弟目录失败: {subRel} - {ex.Message}");
+                                }
+                            }
+                        }
+                    }
+                    catch { /* 忽略单个子目录失败 */ }
+                }
+
+                if (di.EnumerateFileSystemInfos().Any()) break; // 仍然非空，停止
 
                 var relativePath = Path.GetRelativePath(_syncFolder, dir).Replace('\\', '/');
                 FileLogger.Log($"  清理空占位符父目录: {relativePath}");
