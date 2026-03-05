@@ -141,7 +141,7 @@ public sealed class TrayIconService : IDisposable
     private enum DotColor { None, Green, Orange }
 
     /// <summary>
-    /// 程序化绘制 16×16 托盘图标：红色圆角背景 + 白色 "e" + 立体状态圆点
+    /// 从 app.ico 加载 16×16 底图 + 叠加立体状态圆点
     /// </summary>
     private static Icon CreateTrayIcon(DotColor dotColor)
     {
@@ -152,31 +152,38 @@ public sealed class TrayIconService : IDisposable
             g.SmoothingMode = SmoothingMode.HighQuality;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             g.CompositingQuality = CompositingQuality.HighQuality;
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
             g.Clear(Color.Transparent);
 
-            // ── 红色圆角方形背景（EHang品牌红）──
-            using var bgPath = new GraphicsPath();
-            const float cr = 3.5f;
-            bgPath.AddArc(0f, 0f, cr, cr, 180, 90);
-            bgPath.AddArc(sz - cr - 1, 0f, cr, cr, 270, 90);
-            bgPath.AddArc(sz - cr - 1, sz - cr - 1, cr, cr, 0, 90);
-            bgPath.AddArc(0f, sz - cr - 1, cr, cr, 90, 90);
-            bgPath.CloseFigure();
-
-            using var bgBrush = new LinearGradientBrush(
-                new Rectangle(0, 0, sz, sz),
-                Color.FromArgb(255, 180, 30, 35),   // EHang Red
-                Color.FromArgb(255, 130, 15, 20),   // EHang Dark Red
-                LinearGradientMode.ForwardDiagonal);
-            g.FillPath(bgBrush, bgPath);
-
-            // ── 白色 "e" 字母 ──
-            using var ePen = new Pen(Color.White, 2.0f);
-            ePen.StartCap = LineCap.Round;
-            ePen.EndCap = LineCap.Round;
-            var eRect = new RectangleF(3f, 2.5f, 9f, 9f);
-            g.DrawArc(ePen, eRect, 20, 320); // 开口朝右
-            g.DrawLine(ePen, 3.8f, 7f, 11.5f, 7f); // 中横线
+            // ── 从嵌入式资源加载 app.ico 底图 ──
+            var icoStream = System.Reflection.Assembly.GetExecutingAssembly()
+                .GetManifestResourceStream("app.ico");
+            if (icoStream != null)
+            {
+                using var ico = new Icon(icoStream, sz, sz);
+                g.DrawIcon(ico, new Rectangle(0, 0, sz, sz));
+                icoStream.Dispose();
+            }
+            else
+            {
+                // fallback: 红色圆角方形 + "e"
+                using var bgPath = new GraphicsPath();
+                const float cr = 3.5f;
+                bgPath.AddArc(0f, 0f, cr, cr, 180, 90);
+                bgPath.AddArc(sz - cr - 1, 0f, cr, cr, 270, 90);
+                bgPath.AddArc(sz - cr - 1, sz - cr - 1, cr, cr, 0, 90);
+                bgPath.AddArc(0f, sz - cr - 1, cr, cr, 90, 90);
+                bgPath.CloseFigure();
+                using var bgBrush = new LinearGradientBrush(
+                    new Rectangle(0, 0, sz, sz),
+                    Color.FromArgb(255, 180, 30, 35),
+                    Color.FromArgb(255, 130, 15, 20),
+                    LinearGradientMode.ForwardDiagonal);
+                g.FillPath(bgBrush, bgPath);
+                using var ePen = new Pen(Color.White, 2.0f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+                g.DrawArc(ePen, new RectangleF(3f, 2.5f, 9f, 9f), 20, 320);
+                g.DrawLine(ePen, 3.8f, 7f, 11.5f, 7f);
+            }
 
             // ── 立体状态圆点（右下角）──
             if (dotColor != DotColor.None)
