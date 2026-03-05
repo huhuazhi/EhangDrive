@@ -490,12 +490,73 @@ public sealed class SyncEngine : IDisposable
             FileLogger.Log($"  DeleteAsync → {ok}");
 
             if (ok)
+            {
                 SyncStatusManager.Instance.AddLog("✅", $"服务端已删除: {evt.RelativePath}");
+
+                // ── 清理空的占位符父目录 ──
+                // 删除大目录树时 FileSystemWatcher 缓冲区可能溢出，
+                // 导致中间层目录的 Deleted 事件丢失，遗留空的 placeholder 目录。
+                // 每次成功删除子项后，向上逐级检查并清理空的占位符父目录。
+                await CleanupEmptyParentDirsAsync(pending.fullPath);
+            }
             else
                 SyncStatusManager.Instance.AddLog("❌", $"服务端删除失败: {evt.RelativePath}");
         });
 
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 向上逐级清理空的占位符父目录。
+    /// 当 FileSystemWatcher 缓冲区溢出时，中间层目录的 Deleted 事件可能丢失，
+    /// 导致空的 placeholder 目录残留。此方法在子项删除成功后自动清理。
+    /// </summary>
+    private async Task CleanupEmptyParentDirsAsync(string childFullPath)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(childFullPath);
+            while (!string.IsNullOrEmpty(dir)
+                   && !string.Equals(dir, _syncFolder, StringComparison.OrdinalIgnoreCase))
+            {
+                if (!Directory.Exists(dir)) break;
+
+                var di = new DirectoryInfo(dir);
+
+                // 只清理空的占位符目录（ReparsePoint = Cloud Filter placeholder）
+                if (!di.Attributes.HasFlag(FileAttributes.ReparsePoint)) break;
+                if (di.EnumerateFileSystemInfos().Any()) break; // 非空，停止
+
+                var relativePath = Path.GetRelativePath(_syncFolder, dir).Replace('\\', '/');
+                FileLogger.Log($"  清理空占位符父目录: {relativePath}");
+
+                // 先删服务端
+                var ok = await _api.DeleteAsync(relativePath);
+                if (ok)
+                {
+                    // 再删本地
+                    try { Directory.Delete(dir); }
+                    catch (Exception ex)
+                    {
+                        FileLogger.Log($"  删除本地空目录失败: {relativePath} - {ex.Message}");
+                        break;
+                    }
+                    SyncStatusManager.Instance.AddLog("✅", $"清理空目录: {relativePath}");
+                }
+                else
+                {
+                    FileLogger.Log($"  服务端删除空目录失败: {relativePath}");
+                    break;
+                }
+
+                // 继续向上检查
+                dir = Path.GetDirectoryName(dir);
+            }
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"  CleanupEmptyParentDirs 异常: {ex.Message}");
+        }
     }
 
     /// <summary>

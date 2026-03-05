@@ -24,13 +24,14 @@ public sealed class FileWatcherService : IDisposable
                          | NotifyFilters.LastWrite
                          | NotifyFilters.Size
                          | NotifyFilters.Attributes,
-            InternalBufferSize = 64 * 1024, // 64KB 缓冲区，防止事件丢失
+            InternalBufferSize = 256 * 1024, // 256KB 缓冲区，防止大目录树删除时事件丢失
         };
 
         _watcher.Created += OnCreated;
         _watcher.Renamed += OnRenamed;
         _watcher.Changed += OnChanged;
         _watcher.Deleted += OnDeleted;
+        _watcher.Error += OnError;
     }
 
     public void Start()
@@ -212,6 +213,18 @@ public sealed class FileWatcherService : IDisposable
             relativePath,
             e.OldFullPath,
             oldRelativePath));
+    }
+
+    /// <summary>
+    /// FileSystemWatcher 缓冲区溢出或内部错误。
+    /// 大量文件/目录同时删除时 256KB 缓冲区仍可能不够，
+    /// 此时部分 Deleted 事件丢失。HandleDelete 的 CleanupEmptyParentDirs
+    /// 会在子项删除后自动向上清理空的占位符目录，弥补丢失的事件。
+    /// </summary>
+    private void OnError(object sender, ErrorEventArgs e)
+    {
+        FileLogger.Log($"FileWatcher.Error: {e.GetException().Message}");
+        FileLogger.Log($"  可能有文件系统事件丢失，空占位符目录将在子项删除时自动清理");
     }
 
     public void Dispose()
