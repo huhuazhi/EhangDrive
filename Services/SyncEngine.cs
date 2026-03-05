@@ -65,6 +65,10 @@ public sealed class SyncEngine : IDisposable
     // 全量扫描防并发：0=空闲, 1=扫描排队或进行中
     private int _scanPending;
 
+    // 延迟批量目录清理：收集所有待清理的父目录路径，批量处理避免并发竞争
+    private readonly ConcurrentDictionary<string, byte> _pendingCleanupDirs = new(StringComparer.OrdinalIgnoreCase);
+    private int _cleanupRunning; // 0=空闲, 1=运行中
+
     // ModList 操作抑制：ModList 删除/脱水本地文件时，抑制 FileWatcher 产生的 Delete/Changed 事件
     // key=fullPath, value=ticks
     private readonly ConcurrentDictionary<string, long> _modListSuppressed = new(StringComparer.OrdinalIgnoreCase);
@@ -530,11 +534,8 @@ public sealed class SyncEngine : IDisposable
             {
                 SyncStatusManager.Instance.AddLog("✅", $"服务端已删除: {evt.RelativePath}");
 
-                // ── 清理空的占位符父目录 ──
-                // 删除大目录树时 FileSystemWatcher 缓冲区可能溢出，
-                // 导致中间层目录的 Deleted 事件丢失，遗留空的 placeholder 目录。
-                // 每次成功删除子项后，向上逐级检查并清理空的占位符父目录。
-                await CleanupEmptyParentDirsAsync(pending.fullPath);
+                // ── 注册空目录清理（延迟批量执行，避免并发竞争）──
+                ScheduleDirectoryCleanup(pending.fullPath);
             }
             else
                 SyncStatusManager.Instance.AddLog("❌", $"服务端删除失败: {evt.RelativePath}");
@@ -544,79 +545,145 @@ public sealed class SyncEngine : IDisposable
     }
 
     /// <summary>
-    /// 向上逐级清理空的占位符父目录。
-    /// 当 FileSystemWatcher 缓冲区溢出时，中间层目录的 Deleted 事件可能丢失，
-    /// 导致空的 placeholder 目录残留。此方法在子项删除成功后自动清理。
+    /// 注册一个已删除子项的父目录链到待清理集合，并启动延迟批量清理。
+    /// 删除大目录树时，数百个 HandleDelete 并发完成，每个都注册父目录，
+    /// 但只有一个 RunDeferredCleanupAsync 实例实际执行清理，避免并发竞争。
     /// </summary>
-    private async Task CleanupEmptyParentDirsAsync(string childFullPath)
+    private void ScheduleDirectoryCleanup(string childFullPath)
+    {
+        var dir = Path.GetDirectoryName(childFullPath);
+        while (!string.IsNullOrEmpty(dir)
+               && !string.Equals(dir, _syncFolder, StringComparison.OrdinalIgnoreCase))
+        {
+            _pendingCleanupDirs[dir] = 0;
+            dir = Path.GetDirectoryName(dir);
+        }
+
+        // 只允许一个清理任务运行
+        if (Interlocked.CompareExchange(ref _cleanupRunning, 1, 0) == 0)
+        {
+            _ = Task.Run(RunDeferredCleanupAsync);
+        }
+    }
+
+    /// <summary>
+    /// 延迟批量清理空的占位符目录。
+    /// 等待删除风暴平息后，从最深目录开始逐级向上清理。
+    /// 单线程执行，避免并发竞争和重复 API 调用。
+    /// </summary>
+    private async Task RunDeferredCleanupAsync()
     {
         try
         {
-            var dir = Path.GetDirectoryName(childFullPath);
-            while (!string.IsNullOrEmpty(dir)
-                   && !string.Equals(dir, _syncFolder, StringComparison.OrdinalIgnoreCase))
+            // 等待删除风暴平息（HandleDelete 有 3 秒延迟 + 服务端请求时间）
+            await Task.Delay(5000);
+
+            // 可能持续有新路径注册，循环处理直到稳定
+            while (true)
             {
-                if (!Directory.Exists(dir)) break;
+                // 快照并清空待清理集合
+                var dirs = _pendingCleanupDirs.Keys.ToList();
+                foreach (var d in dirs) _pendingCleanupDirs.TryRemove(d, out _);
 
-                var di = new DirectoryInfo(dir);
+                if (dirs.Count == 0) break;
 
-                // 只清理空的占位符目录（ReparsePoint = Cloud Filter placeholder）
-                if (!di.Attributes.HasFlag(FileAttributes.ReparsePoint)) break;
+                // 按路径长度降序（最深目录优先），实现自底向上清理
+                dirs.Sort((a, b) => b.Length.CompareTo(a.Length));
 
-                // 先清理该目录下所有空的 placeholder 子目录（兄弟节点可能遗留）
-                foreach (var sub in di.EnumerateDirectories())
+                FileLogger.Log($"[DeferredCleanup] 开始批量清理，待处理目录数: {dirs.Count}");
+
+                foreach (var dir in dirs)
                 {
                     try
                     {
-                        if (sub.Attributes.HasFlag(FileAttributes.ReparsePoint)
-                            && !sub.EnumerateFileSystemInfos().Any())
+                        if (!Directory.Exists(dir)) continue;
+                        var di = new DirectoryInfo(dir);
+
+                        // 只清理占位符目录（ReparsePoint = Cloud Filter placeholder）
+                        if (!di.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
+
+                        // 先清理该目录下所有空的 placeholder 子目录（FSW 溢出可能漏掉的兄弟节点）
+                        foreach (var sub in di.EnumerateDirectories())
                         {
-                            var subRel = Path.GetRelativePath(_syncFolder, sub.FullName).Replace('\\', '/');
-                            FileLogger.Log($"  清理空占位符兄弟目录: {subRel}");
-                            // 尝试删服务端（不阻塞本地清理）
-                            await _api.DeleteAsync(subRel);
-                            // 本地确认是空 placeholder，直接删
-                            try { sub.Delete(); }
+                            try
+                            {
+                                if (sub.Attributes.HasFlag(FileAttributes.ReparsePoint)
+                                    && !sub.EnumerateFileSystemInfos().Any())
+                                {
+                                    var subRel = Path.GetRelativePath(_syncFolder, sub.FullName).Replace('\\', '/');
+                                    FileLogger.Log($"  [DeferredCleanup] 清理空兄弟目录: {subRel}");
+                                    await _api.DeleteAsync(subRel);
+                                    try { sub.Delete(); } catch { }
+                                }
+                            }
+                            catch { }
+                        }
+
+                        // 刷新：兄弟清理后重新检查是否为空
+                        di.Refresh();
+                        if (!Directory.Exists(dir)) continue;
+                        if (di.EnumerateFileSystemInfos().Any()) continue;
+
+                        var relativePath = Path.GetRelativePath(_syncFolder, dir).Replace('\\', '/');
+                        FileLogger.Log($"  [DeferredCleanup] 清理空占位符目录: {relativePath}");
+
+                        // 服务端删除
+                        var ok = await _api.DeleteAsync(relativePath);
+                        if (!ok)
+                            FileLogger.Log($"  [DeferredCleanup] 服务端删除失败(继续清理本地): {relativePath}");
+
+                        // 标记父目录为 RecentlySynced，防止删除触发 Changed → UNPINNED 误脱水
+                        var parentDir = Path.GetDirectoryName(dir);
+                        if (!string.IsNullOrEmpty(parentDir) && parentDir.Length > _syncFolder.Length)
+                            _recentlySynced[parentDir] = DateTime.UtcNow.Ticks;
+
+                        // 本地删除，带重试（并发的脱水/水合操作可能仍持有句柄）
+                        for (int retry = 0; retry < 5; retry++)
+                        {
+                            try
+                            {
+                                Directory.Delete(dir);
+                                SyncStatusManager.Instance.AddLog("✅", $"清理空目录: {relativePath}");
+                                break;
+                            }
+                            catch (UnauthorizedAccessException) when (retry < 4)
+                            {
+                                FileLogger.Log($"  [DeferredCleanup] 删除失败(重试 {retry + 1}/5): {relativePath}");
+                                await Task.Delay(2000);
+                            }
                             catch (Exception ex)
                             {
-                                FileLogger.Log($"  删除本地兄弟目录失败: {subRel} - {ex.Message}");
+                                FileLogger.Log($"  [DeferredCleanup] 删除失败: {relativePath} - {ex.Message}");
+                                break;
                             }
                         }
                     }
-                    catch { /* 忽略单个子目录失败 */ }
+                    catch (Exception ex)
+                    {
+                        FileLogger.Log($"  [DeferredCleanup] 处理目录异常: {dir} - {ex.Message}");
+                    }
                 }
 
-                if (di.EnumerateFileSystemInfos().Any()) break; // 仍然非空，停止
-
-                var relativePath = Path.GetRelativePath(_syncFolder, dir).Replace('\\', '/');
-                FileLogger.Log($"  清理空占位符父目录: {relativePath}");
-
-                // 先尝试删服务端（即使失败也继续删本地空 placeholder）
-                var ok = await _api.DeleteAsync(relativePath);
-                if (!ok)
-                    FileLogger.Log($"  服务端删除空目录失败(将继续清理本地): {relativePath}");
-
-                // 标记父目录为 RecentlySynced，防止删除触发父 Changed → UNPINNED 误脱水
-                var parentOfCleanup = Path.GetDirectoryName(dir);
-                if (!string.IsNullOrEmpty(parentOfCleanup) && parentOfCleanup.Length > _syncFolder.Length)
-                    _recentlySynced[parentOfCleanup] = DateTime.UtcNow.Ticks;
-
-                // 删本地（本地已确认是空的 ReparsePoint 占位符目录）
-                try { Directory.Delete(dir); }
-                catch (Exception ex)
-                {
-                    FileLogger.Log($"  删除本地空目录失败: {relativePath} - {ex.Message}");
-                    break;
-                }
-                SyncStatusManager.Instance.AddLog("✅", $"清理空目录: {relativePath}");
-
-                // 继续向上检查
-                dir = Path.GetDirectoryName(dir);
+                // 等待一会儿看看是否有新路径注册（清理过程中可能触发新事件）
+                await Task.Delay(3000);
             }
+
+            FileLogger.Log("[DeferredCleanup] 批量清理完成");
         }
         catch (Exception ex)
         {
-            FileLogger.Log($"  CleanupEmptyParentDirs 异常: {ex.Message}");
+            FileLogger.Log($"[DeferredCleanup] 异常: {ex.Message}");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _cleanupRunning, 0);
+
+            // 如果在清理期间又有新路径注册，再启动一轮
+            if (!_pendingCleanupDirs.IsEmpty
+                && Interlocked.CompareExchange(ref _cleanupRunning, 1, 0) == 0)
+            {
+                _ = Task.Run(RunDeferredCleanupAsync);
+            }
         }
     }
 
