@@ -131,9 +131,9 @@ public sealed class ModListPollingService : IDisposable
         {
             try
             {
-                // 抑制目录下所有文件的 FileWatcher 事件
-                foreach (var f in Directory.GetFiles(localPath, "*", SearchOption.AllDirectories))
-                    _syncEngine.SuppressForModList(f);
+                // 抑制目录下所有文件和子目录的 FileWatcher 事件
+                foreach (var entry in Directory.GetFileSystemEntries(localPath, "*", SearchOption.AllDirectories))
+                    _syncEngine.SuppressForModList(entry);
                 _syncEngine.SuppressForModList(localPath);
                 Directory.Delete(localPath, recursive: true);
                 FileLogger.Log($"ModList: 远程删除目录 → 已删本地目录: {item.Path}");
@@ -160,13 +160,13 @@ public sealed class ModListPollingService : IDisposable
             {
                 try
                 {
-                    // 抑制旧路径和新路径下所有文件的 FileWatcher 事件
-                    foreach (var f in Directory.GetFiles(oldLocalPath, "*", SearchOption.AllDirectories))
+                    // 抑制旧路径和新路径下所有文件与子目录的 FileWatcher 事件
+                    foreach (var entry in Directory.GetFileSystemEntries(oldLocalPath, "*", SearchOption.AllDirectories))
                     {
-                        _syncEngine.SuppressForModList(f);
-                        var rel = Path.GetRelativePath(oldLocalPath, f);
-                        var newF = Path.Combine(newLocalPath, rel);
-                        _syncEngine.MarkRecentlySynced(newF);
+                        _syncEngine.SuppressForModList(entry);
+                        var rel = Path.GetRelativePath(oldLocalPath, entry);
+                        var newEntry = Path.Combine(newLocalPath, rel);
+                        _syncEngine.MarkRecentlySynced(newEntry);
                     }
                     _syncEngine.SuppressForModList(oldLocalPath);
                     _syncEngine.MarkRecentlySynced(newLocalPath);
