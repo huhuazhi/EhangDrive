@@ -35,6 +35,13 @@ public sealed class SyncProviderConnection : IDisposable
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _dehydrateCooldown = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// PinState 延迟重试：Windows 异步传播 PinState，Changed 事件可能先于 PinState 到达，
+    /// 读到 PinState=0 (UNSPECIFIED) 时存入待重试队列，3 秒后批量重新读取并处理。
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _pinRetryPaths = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly System.Threading.Timer _pinRetryTimer = new(static _ => ProcessPinRetries(), null, Timeout.Infinite, Timeout.Infinite);
+
+    /// <summary>
     /// 连接到已注册的同步根目录
     /// </summary>
     /// <summary>
@@ -570,8 +577,12 @@ public sealed class SyncProviderConnection : IDisposable
                     uint pinState = (uint)Marshal.ReadInt32(buf, 0);
                     if (pinState != 1)
                     {
+                        // PinState=0 (UNSPECIFIED): Windows 异步传播 PinState 可能尚未完成，
+                        // 延迟 3 秒后批量重试，等待传播完成后再处理 Pin/Unpin
+                        if (pinState == 0)
+                            SchedulePinRetry(fullPath);
                         FileLogger.Log($"TryHandlePinRequest 跳过(PinState={pinState}，非PINNED): {fullPath}");
-                        return false; // 不是 PINNED，让其他处理器处理
+                        return false;
                     }
                 }
                 finally { Marshal.FreeHGlobal(buf); }
@@ -638,6 +649,17 @@ public sealed class SyncProviderConnection : IDisposable
                     }
                     FileLogger.Log($"  已水合: {fullPath} ({count}个文件)");
                     _dehydrateCooldown["PIN:" + fullPath] = DateTime.UtcNow.Ticks;
+                    // 恢复目录及所有子目录的 IN_SYNC（防止白云图标）
+                    SetItemInSync(fullPath);
+                    foreach (var subDir in Directory.GetDirectories(fullPath, "*", SearchOption.AllDirectories))
+                    {
+                        try
+                        {
+                            SetItemInSync(subDir);
+                            _dehydrateCooldown["PIN:" + subDir] = DateTime.UtcNow.Ticks;
+                        }
+                        catch { }
+                    }
                     return true;
                 }
                 else
@@ -683,6 +705,50 @@ public sealed class SyncProviderConnection : IDisposable
             FileLogger.Log($"TryHandlePinRequest 异常: {ex.Message}");
             return false;
         }
+    }
+
+    /// <summary>
+    /// 将 PinState=0 的 placeholder 路径加入延迟重试队列。
+    /// 使用防抖定时器，3 秒内无新路径加入后统一处理。
+    /// </summary>
+    private static void SchedulePinRetry(string fullPath)
+    {
+        _pinRetryPaths.TryAdd(fullPath, 0);
+        _pinRetryTimer.Change(3000, Timeout.Infinite);
+    }
+
+    /// <summary>
+    /// 批量处理 PinState 延迟重试：重新读取 PinState，按实际值分发到 Pin/Unpin 处理器。
+    /// </summary>
+    private static void ProcessPinRetries()
+    {
+        var paths = _pinRetryPaths.Keys.ToList();
+        _pinRetryPaths.Clear();
+
+        if (paths.Count == 0) return;
+
+        FileLogger.Log($"PinState 延迟重试: 检查 {paths.Count} 个路径");
+        int pinCount = 0, unpinCount = 0;
+
+        foreach (var path in paths)
+        {
+            try
+            {
+                uint pinState = GetFilePinState(path);
+                if (pinState == 1)
+                {
+                    if (TryHandlePinRequest(path)) pinCount++;
+                }
+                else if (pinState == 2)
+                {
+                    if (TryHandleDehydrateRequest(path)) unpinCount++;
+                }
+                // pinState == 0: 仍为 UNSPECIFIED，放弃（非 Pin/Unpin 操作触发的变化）
+            }
+            catch { }
+        }
+
+        FileLogger.Log($"PinState 延迟重试完成: Pin={pinCount}, Unpin={unpinCount}");
     }
 
     /// <summary>
