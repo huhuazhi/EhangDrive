@@ -418,15 +418,19 @@ public sealed class SyncProviderConnection : IDisposable
                             try
                             {
                                 int dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
-                                // 0x80070187 = CLOUD_FILE_NOT_IN_SYNC → 先设 IN_SYNC 再重试
-                                if (dhr == unchecked((int)0x80070187))
+                                // 0x80070187 (NOT_IN_SYNC) 或 0x80070188 (DEHYDRATION_DISALLOWED)：
+                                // Pin→Unpin 快速切换时，PinState/InSync 传播可能未完成，多次重试
+                                if (dhr == unchecked((int)0x80070187) || dhr == unchecked((int)0x80070188))
                                 {
-                                    CfSetInSyncState(fh,
-                                        CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
-                                        CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
-                                        IntPtr.Zero);
-                                    Thread.Sleep(300);
-                                    dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
+                                    for (int retry = 0; retry < 3 && dhr < 0; retry++)
+                                    {
+                                        CfSetInSyncState(fh,
+                                            CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                                            CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                                            IntPtr.Zero);
+                                        Thread.Sleep(1000);
+                                        dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
+                                    }
                                 }
                                 if (dhr >= 0)
                                 {
@@ -437,7 +441,15 @@ public sealed class SyncProviderConnection : IDisposable
                                         CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
                                         IntPtr.Zero);
                                 }
-                                else FileLogger.Log($"  Dehydrate 失败: 0x{(uint)dhr:X8} {Path.GetFileName(file)}");
+                                else
+                                {
+                                    // 重试也失败，至少设置 IN_SYNC 防止蓝圈
+                                    CfSetInSyncState(fh,
+                                        CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                                        CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                                        IntPtr.Zero);
+                                    FileLogger.Log($"  Dehydrate 失败(重试后): 0x{(uint)dhr:X8} {Path.GetFileName(file)}");
+                                }
                             }
                             finally { CloseHandle(fh); }
                         }
@@ -461,16 +473,20 @@ public sealed class SyncProviderConnection : IDisposable
 
                     FileLogger.Log($"DEHYDRATE: UNPINNED 文件检测到，释放空间: {fullPath}");
                     int dhr = CfDehydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
-                    // 0x80070187 = CLOUD_FILE_NOT_IN_SYNC：文件刚水合完，IN_SYNC 还没设 → 先设 IN_SYNC 再重试
-                    if (dhr == unchecked((int)0x80070187))
+                    // 0x80070187 (NOT_IN_SYNC) 或 0x80070188 (DEHYDRATION_DISALLOWED)：
+                    // Pin→Unpin 快速切换时，PinState/InSync 传播未完成，多次重试
+                    if (dhr == unchecked((int)0x80070187) || dhr == unchecked((int)0x80070188))
                     {
-                        FileLogger.Log($"  Dehydrate NOT_IN_SYNC，设 IN_SYNC 后重试: {fullPath}");
-                        CfSetInSyncState(handle,
-                            CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
-                            CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
-                            IntPtr.Zero);
-                        Thread.Sleep(300);
-                        dhr = CfDehydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
+                        FileLogger.Log($"  Dehydrate 失败 0x{(uint)dhr:X8}，重试中: {fullPath}");
+                        for (int retry = 0; retry < 3 && dhr < 0; retry++)
+                        {
+                            CfSetInSyncState(handle,
+                                CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                                CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                                IntPtr.Zero);
+                            Thread.Sleep(1000);
+                            dhr = CfDehydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
+                        }
                     }
                     if (dhr >= 0)
                     {
@@ -485,8 +501,13 @@ public sealed class SyncProviderConnection : IDisposable
                     }
                     else
                     {
-                        FileLogger.Log($"  Dehydrate 失败: 0x{(uint)dhr:X8} {fullPath}");
-                        return false;
+                        // 重试也失败，至少设 IN_SYNC 防止蓝圈
+                        CfSetInSyncState(handle,
+                            CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                            CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                            IntPtr.Zero);
+                        FileLogger.Log($"  Dehydrate 失败(重试后): 0x{(uint)dhr:X8} {fullPath}");
+                        return true; // 返回 true 防止后续处理器再处理
                     }
                 }
             }
