@@ -265,6 +265,31 @@ public sealed class SyncProviderConnection : IDisposable
         catch { }
     }
 
+    /// <summary>
+    /// 检查文件路径是否位于最近被脱水（释放空间）的目录/文件中（5秒内）。
+    /// 用于 FETCH_DATA 回调中阻止资源管理器缩略图/预览触发的重新水合。
+    /// </summary>
+    private static bool IsRecentlyDehydratedPath(string fullPath)
+    {
+        var nowTicks = DateTime.UtcNow.Ticks;
+        var threshold = TimeSpan.TicksPerSecond * 5;
+
+        // 检查文件自身（单文件脱水场景）
+        if (_dehydrateCooldown.TryGetValue(fullPath, out var fileTicks) && (nowTicks - fileTicks) < threshold)
+            return true;
+
+        // 检查父目录链（目录脱水场景）
+        var dir = Path.GetDirectoryName(fullPath);
+        while (dir != null && _syncFolder != null && dir.Length >= _syncFolder.Length)
+        {
+            if (_dehydrateCooldown.TryGetValue(dir, out var dirTicks) && (nowTicks - dirTicks) < threshold)
+                return true;
+            dir = Path.GetDirectoryName(dir);
+        }
+
+        return false;
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateFileW(
         string lpFileName, uint dwDesiredAccess, uint dwShareMode,
@@ -334,20 +359,17 @@ public sealed class SyncProviderConnection : IDisposable
                         }
                         catch { }
                         if (!needsDehydration)
+                        {
+                            // 驱动可能异步清除 IN_SYNC（蓝圈），趁 Changed 事件到达时恢复
+                            SetItemInSync(fullPath);
                             return true; // 文件已脱水，安全跳过
+                        }
                         FileLogger.Log($"TryHandleDehydrateRequest 冷却期内但文件需要脱水，继续处理: {fullPath}");
                     }
                 }
 
                 if (isDir)
                 {
-                    // 爆发检测：目录级脱水，如果该目录树已超阈值则跳过（批量删除场景）
-                    if (_syncEngine?.RecordDehydrateAndCheckSuppressed(fullPath) == true)
-                    {
-                        FileLogger.Log($"DEHYDRATE: 跳过(删除爆发抑制): {fullPath}");
-                        return true;
-                    }
-
                     // 目录：递归释放所有已 hydrated 文件
                     FileLogger.Log($"DEHYDRATE: UNPINNED 目录检测到，释放空间: {fullPath}");
                     int count = 0;
@@ -367,7 +389,15 @@ public sealed class SyncProviderConnection : IDisposable
                             try
                             {
                                 int dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
-                                if (dhr >= 0) count++;
+                                if (dhr >= 0)
+                                {
+                                    count++;
+                                    // 脱水后恢复 IN_SYNC，防止蓝圈
+                                    CfSetInSyncState(fh,
+                                        CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                                        CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                                        IntPtr.Zero);
+                                }
                                 else FileLogger.Log($"  Dehydrate 失败: 0x{(uint)dhr:X8} {Path.GetFileName(file)}");
                             }
                             finally { CloseHandle(fh); }
@@ -376,17 +406,16 @@ public sealed class SyncProviderConnection : IDisposable
                     }
                     FileLogger.Log($"  已释放空间: {fullPath} ({count}个文件)");
                     _dehydrateCooldown[fullPath] = DateTime.UtcNow.Ticks;
+                    // 目录及子目录设置 IN_SYNC，防止蓝圈
+                    SetItemInSync(fullPath);
+                    foreach (var subDir in Directory.GetDirectories(fullPath, "*", SearchOption.AllDirectories))
+                    {
+                        try { SetItemInSync(subDir); } catch { }
+                    }
                     return true;
                 }
                 else
                 {
-                    // 单个文件：爆发检测
-                    if (_syncEngine?.RecordDehydrateAndCheckSuppressed(fullPath) == true)
-                    {
-                        FileLogger.Log($"DEHYDRATE: 跳过(删除爆发抑制): {fullPath}");
-                        return true;
-                    }
-
                     var fi = new FileInfo(fullPath);
                     if (fi.Attributes.HasFlag(FileAttributes.Offline)) return true; // 已 dehydrated
                     if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) return false; // 不是 placeholder
@@ -395,6 +424,11 @@ public sealed class SyncProviderConnection : IDisposable
                     int dhr = CfDehydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
                     if (dhr >= 0)
                     {
+                        // 脱水后恢复 IN_SYNC，防止蓝圈
+                        CfSetInSyncState(handle,
+                            CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                            CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                            IntPtr.Zero);
                         FileLogger.Log($"  已释放空间: {fullPath}");
                         _dehydrateCooldown[fullPath] = DateTime.UtcNow.Ticks;
                         return true;
@@ -493,6 +527,9 @@ public sealed class SyncProviderConnection : IDisposable
                     }
                 }
 
+                // 用户 Pin 时清除脱水冷却，允许后续 FETCH_DATA 水合
+                _dehydrateCooldown.TryRemove(fullPath, out _);
+
                 if (isDir)
                 {
                     // 目录：递归水合所有 dehydrated 文件
@@ -504,7 +541,12 @@ public sealed class SyncProviderConnection : IDisposable
                         {
                             var fi = new FileInfo(file);
                             if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
-                            if (!fi.Attributes.HasFlag(FileAttributes.Offline)) continue; // 已 hydrated，跳过
+                            if (!fi.Attributes.HasFlag(FileAttributes.Offline))
+                            {
+                                // 已 hydrated，记录 mtime 防止后续 Unpin 触发误上传
+                                _syncEngine?.RecordFileMtime(file);
+                                continue;
+                            }
 
                             var fh = CreateFileW(file,
                                 0x00000181, // FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
@@ -533,6 +575,10 @@ public sealed class SyncProviderConnection : IDisposable
                     {
                         // 已 hydrated，刷新冷却防止过期后漏检
                         _dehydrateCooldown["PIN:" + fullPath] = DateTime.UtcNow.Ticks;
+                        // 记录 mtime，防止后续 Unpin 触发的 Changed 事件导致误上传
+                        _syncEngine?.RecordFileMtime(fullPath);
+                        // 驱动可能异步清除 IN_SYNC（蓝圈），趁 Changed 事件到达时恢复
+                        SetItemInSync(fullPath);
                         FileLogger.Log($"TryHandlePinRequest PINNED+已水合，刷新冷却: {fullPath}");
                         return true;
                     }
@@ -630,7 +676,7 @@ public sealed class SyncProviderConnection : IDisposable
             if (_syncEngine != null && _syncFolder != null)
             {
                 var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
-                if (_syncEngine.IsInSuppressedTree(fullPath))
+                if (_syncEngine.IsInSuppressedTree(fullPath) && _syncEngine.HasPendingDelete(relativePath))
                 {
                     FileLogger.Log($"  FETCH_DATA 跳过(删除爆发抑制): {relativePath}");
                     // 返回错误状态让 Windows 知道不提供数据
@@ -652,6 +698,36 @@ public sealed class SyncProviderConnection : IDisposable
                         Length = 0,
                     };
                     CfExecute(in cancelOpInfo, ref cancelOpParams);
+                    return;
+                }
+
+                // 检查文件是否在刚被释放空间的目录内（5秒内）
+                // 资源管理器/SMB 浏览目录时会为图片等文件生成缩略图/预览，
+                // 触发 FETCH_DATA 把刚脱水的文件重新水合，导致释放空间被撤销+蓝圈。
+                // 取消此类 FETCH_DATA，保持文件脱水状态。
+                if (IsRecentlyDehydratedPath(fullPath))
+                {
+                    FileLogger.Log($"  FETCH_DATA 跳过(最近脱水，防止重新水合): {relativePath}");
+                    var cancelOpInfo2 = new CF_OPERATION_INFO
+                    {
+                        StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
+                        Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
+                        ConnectionKey = connectionKey,
+                        TransferKey = transferKey,
+                        SyncStatus = IntPtr.Zero,
+                        RequestKey = requestKey,
+                    };
+                    var cancelOpParams2 = new CF_OPERATION_PARAMETERS_TRANSFERDATA
+                    {
+                        ParamSize = (uint)Marshal.SizeOf<CF_OPERATION_PARAMETERS_TRANSFERDATA>(),
+                        CompletionStatus = unchecked((int)0xC000_0120), // STATUS_CANCELLED
+                        Buffer = IntPtr.Zero,
+                        Offset = 0,
+                        Length = 0,
+                    };
+                    CfExecute(in cancelOpInfo2, ref cancelOpParams2);
+                    // 确保文件保持 IN_SYNC（脱水后驱动可能清除）
+                    SetItemInSync(fullPath);
                     return;
                 }
 
@@ -802,6 +878,16 @@ public sealed class SyncProviderConnection : IDisposable
                 var fullPath = Path.Combine(_syncFolder, relativePath.Replace('/', '\\'));
                 _syncEngine.SuppressForModList(fullPath);
                 _syncEngine.SetInSyncAfterHydration(fullPath);
+
+                // 驱动可能在 SetInSyncAfterHydration 之后异步清除 IN_SYNC（导致蓝圈）。
+                // 延迟 3 秒后再设置一次，作为安全网。
+                var captured = fullPath;
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(3000);
+                    try { SyncProviderConnection.SetItemInSync(captured); }
+                    catch { }
+                });
             }
 
             } // end try (EndBusy)

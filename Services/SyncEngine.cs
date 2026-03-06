@@ -70,66 +70,25 @@ public sealed class SyncEngine : IDisposable
     private int _cleanupRunning; // 0=空闲, 1=运行中
 
     // ── 删除目录树爆发抑制 ──
-    // 目录树下短时间内大量 DEHYDRATE 请求说明是批量删除，阻止后续一切无用操作
-    // key=目录路径（树根）, value=(计数, 首次时间ticks)
-    private readonly ConcurrentDictionary<string, (int count, long firstTicks)> _dehydrateBurst = new(StringComparer.OrdinalIgnoreCase);
     // 已确认为正在删除的目录树前缀集合，key=fullPath前缀
     private readonly ConcurrentDictionary<string, long> _suppressedTrees = new(StringComparer.OrdinalIgnoreCase);
-    private const int BURST_THRESHOLD = 5;     // 2秒内超过此数则判定为删除爆发
-    private const int BURST_WINDOW_MS = 2000;  // 爆发检测时间窗口
     private const int SUPPRESS_DURATION_S = 60; // 抑制持续时间
 
     /// <summary>
-    /// 记录一次 DEHYDRATE 事件，超过阈值时将父目录标记为 suppressedTree。
-    /// 由 SyncProviderConnection.TryHandleDehydrateRequest 调用。
+    /// 检查指定的相对路径（或其任意祖先目录）是否在待删除队列中。
     /// </summary>
-    public bool RecordDehydrateAndCheckSuppressed(string fullPath)
+    public bool HasPendingDelete(string relativePath)
     {
-        // 提取最近的 3 级父目录作为 burst 跟踪 key（同一棵树下的文件聚合）
-        var dir = Path.GetDirectoryName(fullPath);
-        if (string.IsNullOrEmpty(dir)) return false;
-
-        // 向上找到最近未被 suppress 的目录，或直接使用当前目录
-        var trackDir = dir;
-        var nowTicks = DateTime.UtcNow.Ticks;
-
-        // 先检查是否已被抑制
-        if (IsInSuppressedTree(fullPath)) return true;
-
-        var entry = _dehydrateBurst.AddOrUpdate(
-            trackDir,
-            _ => (1, nowTicks),
-            (_, old) =>
-            {
-                if ((nowTicks - old.firstTicks) > TimeSpan.FromMilliseconds(BURST_WINDOW_MS).Ticks)
-                    return (1, nowTicks); // 窗口过期，重新计数
-                return (old.count + 1, old.firstTicks);
-            });
-
-        if (entry.count >= BURST_THRESHOLD)
-        {
-            // 找到更高的被删除树根：向上逐级检查哪些目录也有 burst
-            var treeRoot = trackDir;
-            var parent = Path.GetDirectoryName(trackDir);
-            while (!string.IsNullOrEmpty(parent)
-                   && !string.Equals(parent, _syncFolder, StringComparison.OrdinalIgnoreCase))
-            {
-                if (_dehydrateBurst.TryGetValue(parent, out var pEntry)
-                    && (nowTicks - pEntry.firstTicks) < TimeSpan.FromMilliseconds(BURST_WINDOW_MS).Ticks
-                    && pEntry.count >= 2)
-                {
-                    treeRoot = parent;
-                }
-                parent = Path.GetDirectoryName(parent);
-            }
-
-            _suppressedTrees[treeRoot] = nowTicks;
-            var rel = Path.GetRelativePath(_syncFolder, treeRoot).Replace('\\', '/');
-            FileLogger.Log($"[BurstDetect] 检测到删除爆发，抑制目录树: {rel} (已累计 {entry.count} 次DEHYDRATE)");
-            SyncStatusManager.Instance.AddLog("🛑", $"检测到批量删除，抑制: {rel}");
+        if (_pendingDeletes.ContainsKey(relativePath))
             return true;
+        // 祖先目录也在待删除队列中 → 子路径也算待删除
+        var parts = relativePath.Split('/');
+        for (int i = parts.Length - 1; i > 0; i--)
+        {
+            var ancestor = string.Join('/', parts, 0, i);
+            if (_pendingDeletes.ContainsKey(ancestor))
+                return true;
         }
-
         return false;
     }
 
@@ -288,6 +247,35 @@ public sealed class SyncEngine : IDisposable
     public void MarkRecentlySynced(string fullPath)
     {
         _recentlySynced[fullPath] = DateTime.UtcNow.Ticks;
+    }
+
+    /// <summary>
+    /// 启动时扫描同步目录下所有 placeholder 文件，记录 mtime。
+    /// 这样 HandleModifyFile 可以通过比较 mtime 跳过非内容修改的 Changed 事件（如属性/PinState变化）。
+    /// </summary>
+    public void PopulateInitialMtimes()
+    {
+        try
+        {
+            int count = 0;
+            foreach (var file in Directory.GetFiles(_syncFolder, "*", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    var fi = new FileInfo(file);
+                    if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
+                    var relPath = Path.GetRelativePath(_syncFolder, file).Replace('\\', '/');
+                    _lastUploadedMtime[relPath] = fi.LastWriteTimeUtc.Ticks;
+                    count++;
+                }
+                catch { }
+            }
+            FileLogger.Log($"PopulateInitialMtimes: 已记录 {count} 个文件的 mtime");
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"PopulateInitialMtimes 异常: {ex.Message}");
+        }
     }
 
     public SyncEngine(SyncApiService api, string syncFolder)
@@ -577,6 +565,9 @@ public sealed class SyncEngine : IDisposable
         if (IsRecentlySynced(evt.FullPath))
         {
             FileLogger.Log($"  消费者侧跳过(RecentlySynced): {evt.RelativePath}");
+            // 安全网：FETCH_DATA 水合后 SetInSyncAfterHydration 设置了 IN_SYNC，
+            // 但驱动异步完成可能再次清除。此处确保恢复，防止蓝圈。
+            SyncProviderConnection.SetItemInSyncPublic(evt.FullPath);
             return;
         }
 
@@ -604,6 +595,7 @@ public sealed class SyncEngine : IDisposable
         if (IsRecentlySynced(evt.FullPath))
         {
             FileLogger.Log($"  延迟后跳过(RecentlySynced): {evt.RelativePath}");
+            SyncProviderConnection.SetItemInSyncPublic(evt.FullPath);
             return;
         }
 
@@ -611,9 +603,11 @@ public sealed class SyncEngine : IDisposable
         {
             var fi = new FileInfo(evt.FullPath);
             // Offline = cloud-only 白云文件（未 hydrate），不需要上传
+            // 脱水后驱动可能异步清除 IN_SYNC，需要恢复防止蓝圈
             if (fi.Attributes.HasFlag(System.IO.FileAttributes.Offline))
             {
                 FileLogger.Log($"  跳过 Offline 文件(白云): {evt.RelativePath}");
+                SyncProviderConnection.SetItemInSyncPublic(evt.FullPath);
                 return;
             }
             // 注意：不再用 ReparsePoint 判断是否跳过！
@@ -628,6 +622,9 @@ public sealed class SyncEngine : IDisposable
                 fi.LastWriteTimeUtc.Ticks == lastMtime)
             {
                 FileLogger.Log($"  跳过(placeholder mtime未变): {evt.RelativePath}");
+                // WPS/Office 以读写模式打开文件后关闭（不保存），Cloud Filter 驱动会清除
+                // IN_SYNC 标志（蓝圈），但文件内容实际未变。此处需要重新设置 IN_SYNC。
+                SetInSyncAfterHydration(evt.FullPath);
                 return;
             }
         }
@@ -780,6 +777,16 @@ public sealed class SyncEngine : IDisposable
                         if (!di.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
 
                         // 先清理该目录下所有空的 placeholder 子目录（FSW 溢出可能漏掉的兄弟节点）
+                        // 获取服务端目录内容，判断子目录是否仍在服务端（仍存在=合法目录，不清理）
+                        var relativePath = Path.GetRelativePath(_syncFolder, dir).Replace('\\', '/');
+                        HashSet<string> serverNames;
+                        try
+                        {
+                            var serverItems = await _api.ListDirectoryAsync(relativePath);
+                            serverNames = new HashSet<string>(serverItems.Select(i => i.Name), StringComparer.OrdinalIgnoreCase);
+                        }
+                        catch { serverNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase); }
+
                         foreach (var sub in di.EnumerateDirectories())
                         {
                             try
@@ -787,9 +794,13 @@ public sealed class SyncEngine : IDisposable
                                 if (sub.Attributes.HasFlag(FileAttributes.ReparsePoint)
                                     && !sub.EnumerateFileSystemInfos().Any())
                                 {
+                                    // 服务端仍存在的目录是合法目录，不清理
+                                    if (serverNames.Contains(sub.Name)) continue;
+
                                     var subRel = Path.GetRelativePath(_syncFolder, sub.FullName).Replace('\\', '/');
                                     FileLogger.Log($"  [DeferredCleanup] 清理空兄弟目录: {subRel}");
-                                    await _api.DeleteAsync(subRel);
+                                    // 标记抑制，防止 FileWatcher.Deleted 触发 HandleDelete → MarkTreeSuppressed
+                                    SuppressForModList(sub.FullName);
                                     try { sub.Delete(); } catch { }
                                 }
                             }
@@ -801,13 +812,18 @@ public sealed class SyncEngine : IDisposable
                         if (!Directory.Exists(dir)) continue;
                         if (di.EnumerateFileSystemInfos().Any()) continue;
 
-                        var relativePath = Path.GetRelativePath(_syncFolder, dir).Replace('\\', '/');
+                        // 检查该目录在服务端是否仍然存在 → 存在则跳过（合法目录，不应因子文件删除而被清理）
+                        var dirMeta = await _api.GetFileMetaAsync(relativePath);
+                        if (dirMeta != null)
+                        {
+                            FileLogger.Log($"  [DeferredCleanup] 跳过清理(服务端仍存在): {relativePath}");
+                            continue;
+                        }
+
                         FileLogger.Log($"  [DeferredCleanup] 清理空占位符目录: {relativePath}");
 
-                        // 服务端删除
-                        var ok = await _api.DeleteAsync(relativePath);
-                        if (!ok)
-                            FileLogger.Log($"  [DeferredCleanup] 服务端删除失败(继续清理本地): {relativePath}");
+                        // 标记抑制，防止 FileWatcher.Deleted 触发 HandleDelete → MarkTreeSuppressed
+                        SuppressForModList(dir);
 
                         // 标记父目录为 RecentlySynced，防止删除触发 Changed → UNPINNED 误脱水
                         var parentDir = Path.GetDirectoryName(dir);
@@ -1265,6 +1281,21 @@ public sealed class SyncEngine : IDisposable
             }
             catch { }
         }
+    }
+
+    /// <summary>
+    /// 记录文件的 mtime 到 _lastUploadedMtime，防止后续 Changed 事件触发误上传。
+    /// 用于已水合文件 Pin/Unpin 属性变化场景。
+    /// </summary>
+    public void RecordFileMtime(string fullPath)
+    {
+        try
+        {
+            var fi = new FileInfo(fullPath);
+            var relPath = Path.GetRelativePath(_syncFolder, fullPath).Replace('\\', '/');
+            _lastUploadedMtime[relPath] = fi.LastWriteTimeUtc.Ticks;
+        }
+        catch { }
     }
 
     /// <summary>

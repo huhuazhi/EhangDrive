@@ -165,7 +165,11 @@ public partial class App : Application
         // ──── 创建托盘图标 ───────────────────────────────────────
         _trayIcon = new TrayIconService(
             newConfig.SyncFolder,
-            showMainWindow: () => { _mainWindow?.Show(); _mainWindow?.Activate(); },
+            showMainWindow: () =>
+            {
+                try { _mainWindow?.Show(); _mainWindow?.Activate(); }
+                catch { /* 窗口已关闭或状态异常，忽略 */ }
+            },
             showSettings: () => _mainWindow?.ShowSettingsTab(),
             exitApp: () =>
             {
@@ -249,6 +253,7 @@ public partial class App : Application
         }
 
         // ──── 全量同步完成后启动文件监听 ────────────────────────
+        _ = Task.Run(() => _syncEngine.PopulateInitialMtimes());
         _fileWatcher.Start();
         FileLogger.Log("FileWatcher 已启动（全量同步完成后）");
 

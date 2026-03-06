@@ -47,8 +47,9 @@ public sealed class FileWatcherService : IDisposable
 
     private void OnCreated(object sender, FileSystemEventArgs e)
     {
-        // 被抑制的删除目录树下不处理任何 Created 事件
-        if (_engine.IsInSuppressedTree(e.FullPath)) return;
+        // 不对 Created 事件做爆发抑制！Created 意味着有新文件/移动目标出现，
+        // 即使父目录正在被批量删除，Created 也应该被处理（移动检测依赖它）。
+        // 内部操作（CfCreatePlaceholders）由下面的 IsRecentlySynced 过滤。
 
         FileLogger.Log($"FileWatcher.Created: {e.FullPath}");
 
