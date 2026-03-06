@@ -290,6 +290,35 @@ public sealed class SyncProviderConnection : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// 快速读取文件的 PinState（0=UNSPECIFIED, 1=PINNED, 2=UNPINNED）
+    /// 用于 FETCH_DATA 冷却检查和全量扫描 PinState 不匹配修复。
+    /// </summary>
+    public static uint GetFilePinState(string fullPath)
+    {
+        IntPtr handle = CreateFileW(
+            fullPath,
+            0x00000080, // FILE_READ_ATTRIBUTES
+            0x00000007, // FILE_SHARE_READ | WRITE | DELETE
+            IntPtr.Zero,
+            3,          // OPEN_EXISTING
+            0x02000000, // FILE_FLAG_BACKUP_SEMANTICS
+            IntPtr.Zero);
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return 0;
+        try
+        {
+            IntPtr buf = Marshal.AllocHGlobal(256);
+            try
+            {
+                int hr = CfGetPlaceholderInfo(handle, 0, buf, 256, out uint retLen);
+                if (hr < 0 || retLen < 8) return 0;
+                return (uint)Marshal.ReadInt32(buf, 0);
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+        finally { CloseHandle(handle); }
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateFileW(
         string lpFileName, uint dwDesiredAccess, uint dwShareMode,
@@ -389,6 +418,16 @@ public sealed class SyncProviderConnection : IDisposable
                             try
                             {
                                 int dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
+                                // 0x80070187 = CLOUD_FILE_NOT_IN_SYNC → 先设 IN_SYNC 再重试
+                                if (dhr == unchecked((int)0x80070187))
+                                {
+                                    CfSetInSyncState(fh,
+                                        CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                                        CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                                        IntPtr.Zero);
+                                    Thread.Sleep(300);
+                                    dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
+                                }
                                 if (dhr >= 0)
                                 {
                                     count++;
@@ -422,6 +461,17 @@ public sealed class SyncProviderConnection : IDisposable
 
                     FileLogger.Log($"DEHYDRATE: UNPINNED 文件检测到，释放空间: {fullPath}");
                     int dhr = CfDehydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
+                    // 0x80070187 = CLOUD_FILE_NOT_IN_SYNC：文件刚水合完，IN_SYNC 还没设 → 先设 IN_SYNC 再重试
+                    if (dhr == unchecked((int)0x80070187))
+                    {
+                        FileLogger.Log($"  Dehydrate NOT_IN_SYNC，设 IN_SYNC 后重试: {fullPath}");
+                        CfSetInSyncState(handle,
+                            CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                            CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                            IntPtr.Zero);
+                        Thread.Sleep(300);
+                        dhr = CfDehydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
+                    }
                     if (dhr >= 0)
                     {
                         // 脱水后恢复 IN_SYNC，防止蓝圈
@@ -555,6 +605,8 @@ public sealed class SyncProviderConnection : IDisposable
                             if (fh == IntPtr.Zero || fh == new IntPtr(-1)) continue;
                             try
                             {
+                                // 清除单文件的脱水冷却，让 FETCH_DATA 不被阻止
+                                _dehydrateCooldown.TryRemove(file, out _);
                                 int hhr = CfHydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
                                 if (hhr >= 0) count++;
                                 else FileLogger.Log($"  Hydrate 失败: 0x{(uint)hhr:X8} {Path.GetFileName(file)}");
@@ -704,31 +756,41 @@ public sealed class SyncProviderConnection : IDisposable
                 // 检查文件是否在刚被释放空间的目录内（5秒内）
                 // 资源管理器/SMB 浏览目录时会为图片等文件生成缩略图/预览，
                 // 触发 FETCH_DATA 把刚脱水的文件重新水合，导致释放空间被撤销+蓝圈。
-                // 取消此类 FETCH_DATA，保持文件脱水状态。
+                // 但如果文件已被 PINNED（用户请求"始终保留"），必须允许水合。
                 if (IsRecentlyDehydratedPath(fullPath))
                 {
-                    FileLogger.Log($"  FETCH_DATA 跳过(最近脱水，防止重新水合): {relativePath}");
-                    var cancelOpInfo2 = new CF_OPERATION_INFO
+                    // 关键修复：检查 PinState，PINNED 文件即使在冷却期内也必须允许水合
+                    uint pinState = GetFilePinState(fullPath);
+                    if (pinState == 1) // PINNED — 用户明确要求水合
                     {
-                        StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
-                        Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
-                        ConnectionKey = connectionKey,
-                        TransferKey = transferKey,
-                        SyncStatus = IntPtr.Zero,
-                        RequestKey = requestKey,
-                    };
-                    var cancelOpParams2 = new CF_OPERATION_PARAMETERS_TRANSFERDATA
+                        FileLogger.Log($"  FETCH_DATA 最近脱水但文件已PINNED，允许水合: {relativePath}");
+                        _dehydrateCooldown.TryRemove(fullPath, out _);
+                    }
+                    else
                     {
-                        ParamSize = (uint)Marshal.SizeOf<CF_OPERATION_PARAMETERS_TRANSFERDATA>(),
-                        CompletionStatus = unchecked((int)0xC000_0120), // STATUS_CANCELLED
-                        Buffer = IntPtr.Zero,
-                        Offset = 0,
-                        Length = 0,
-                    };
-                    CfExecute(in cancelOpInfo2, ref cancelOpParams2);
-                    // 确保文件保持 IN_SYNC（脱水后驱动可能清除）
-                    SetItemInSync(fullPath);
-                    return;
+                        FileLogger.Log($"  FETCH_DATA 跳过(最近脱水，防止重新水合): {relativePath}");
+                        var cancelOpInfo2 = new CF_OPERATION_INFO
+                        {
+                            StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
+                            Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
+                            ConnectionKey = connectionKey,
+                            TransferKey = transferKey,
+                            SyncStatus = IntPtr.Zero,
+                            RequestKey = requestKey,
+                        };
+                        var cancelOpParams2 = new CF_OPERATION_PARAMETERS_TRANSFERDATA
+                        {
+                            ParamSize = (uint)Marshal.SizeOf<CF_OPERATION_PARAMETERS_TRANSFERDATA>(),
+                            CompletionStatus = unchecked((int)0xC000_0120), // STATUS_CANCELLED
+                            Buffer = IntPtr.Zero,
+                            Offset = 0,
+                            Length = 0,
+                        };
+                        CfExecute(in cancelOpInfo2, ref cancelOpParams2);
+                        // 确保文件保持 IN_SYNC（脱水后驱动可能清除）
+                        SetItemInSync(fullPath);
+                        return;
+                    }
                 }
 
                 // 在写入数据之前就标记抑制，防止 Changed 事件竞态

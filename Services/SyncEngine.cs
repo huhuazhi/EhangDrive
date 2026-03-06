@@ -1460,6 +1460,43 @@ public sealed class SyncEngine : IDisposable
                 FileLogger.Log($"全量扫描完成: 发现 {fileCount} 个未同步文件, {dirCount} 个未同步目录");
                 if (fileCount + dirCount > 0)
                     SyncStatusManager.Instance.AddLog("🔍", $"缓冲区溢出补偿: 发现 {fileCount} 个文件 + {dirCount} 个目录");
+
+                // ── 第二阶段：扫描 placeholder 文件的 PinState 不匹配 ──
+                // 缓冲区溢出时 Pin/Unpin 的 Changed 事件可能丢失，
+                // 需要扫描修复 PINNED+脱水（应水合）和 UNPINNED+水合（应脱水）的文件。
+                FileLogger.Log("全量扫描: 开始 PinState 不匹配修复...");
+                int pinFixed = 0, unpinFixed = 0;
+                foreach (var entry in syncDi.EnumerateFileSystemInfos("*", new EnumerationOptions
+                {
+                    RecurseSubdirectories = true,
+                    IgnoreInaccessible = true,
+                    AttributesToSkip = 0,
+                }))
+                {
+                    if (entry is not FileInfo pfi) continue;
+                    if (!pfi.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
+
+                    try
+                    {
+                        bool isOffline = pfi.Attributes.HasFlag(FileAttributes.Offline);
+                        uint pinState = SyncProviderConnection.GetFilePinState(pfi.FullName);
+
+                        if (pinState == 1 && isOffline) // PINNED 但未水合
+                        {
+                            if (SyncProviderConnection.TryHandlePinRequest(pfi.FullName))
+                                pinFixed++;
+                        }
+                        else if (pinState == 2 && !isOffline) // UNPINNED 但未脱水
+                        {
+                            if (SyncProviderConnection.TryHandleDehydrateRequest(pfi.FullName))
+                                unpinFixed++;
+                        }
+                    }
+                    catch { }
+                }
+                FileLogger.Log($"全量扫描 PinState: 水合 {pinFixed} 个 PINNED 文件, 脱水 {unpinFixed} 个 UNPINNED 文件");
+                if (pinFixed + unpinFixed > 0)
+                    SyncStatusManager.Instance.AddLog("🔍", $"PinState 修复: 水合 {pinFixed} + 脱水 {unpinFixed}");
             }
             catch (Exception ex)
             {

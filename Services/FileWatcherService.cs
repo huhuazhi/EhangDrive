@@ -162,16 +162,17 @@ public sealed class FileWatcherService : IDisposable
         if (SyncProviderConnection.TryHandleDehydrateRequest(e.FullPath))
             return;
 
+        // 检查是否是"始终保留在此设备上"触发的属性变化（PinState → PINNED）
+        // 必须在 IsModListSuppressed 之前！否则刚下载完的文件的 Pin 事件会被 ModList 抑制吃掉
+        if (SyncProviderConnection.TryHandlePinRequest(e.FullPath))
+            return;
+
         // ModList 脱水操作引起的 Changed 不要重新上传
         if (_engine.IsModListSuppressed(e.FullPath))
         {
             FileLogger.Log($"FileWatcher.Changed 跳过(ModList抑制): {e.FullPath}");
             return;
         }
-
-        // 检查是否是"始终保留在此设备上"触发的属性变化（PinState → PINNED）
-        if (SyncProviderConnection.TryHandlePinRequest(e.FullPath))
-            return;
 
         // 目录的 Changed 事件通常是属性变化（如 Windows 搜索设置 NotContentIndexed），
         // 这类属性变化会清除 Cloud Filter 的 IN_SYNC 状态导致显示白云。
