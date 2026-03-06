@@ -424,20 +424,23 @@ public sealed class SyncProviderConnection : IDisposable
                             if (fh == IntPtr.Zero || fh == new IntPtr(-1)) continue;
                             try
                             {
+                                // 设 IN_SYNC 后立即脱水，不给 PinState 传播清除 IN_SYNC 的时间窗口
+                                CfSetInSyncState(fh,
+                                    CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                                    CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                                    IntPtr.Zero);
                                 int dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
                                 // 0x80070187 (NOT_IN_SYNC) 或 0x80070188 (DEHYDRATION_DISALLOWED)：
-                                // Pin→Unpin 快速切换时，PinState/InSync 传播可能未完成，多次重试
-                                if (dhr == unchecked((int)0x80070187) || dhr == unchecked((int)0x80070188))
+                                // 失败后等待 PinState 传播稳定，再重试（设 IN_SYNC + 立即脱水）
+                                for (int retry = 0; retry < 5 && dhr < 0
+                                    && (dhr == unchecked((int)0x80070187) || dhr == unchecked((int)0x80070188)); retry++)
                                 {
-                                    for (int retry = 0; retry < 3 && dhr < 0; retry++)
-                                    {
-                                        CfSetInSyncState(fh,
-                                            CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
-                                            CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
-                                            IntPtr.Zero);
-                                        Thread.Sleep(1000);
-                                        dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
-                                    }
+                                    Thread.Sleep(1000 * (retry + 1));
+                                    CfSetInSyncState(fh,
+                                        CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                                        CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                                        IntPtr.Zero);
+                                    dhr = CfDehydratePlaceholder(fh, 0, -1, 0, IntPtr.Zero);
                                 }
                                 if (dhr >= 0)
                                 {
@@ -479,19 +482,24 @@ public sealed class SyncProviderConnection : IDisposable
                     if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) return false; // 不是 placeholder
 
                     FileLogger.Log($"DEHYDRATE: UNPINNED 文件检测到，释放空间: {fullPath}");
+                    // 设 IN_SYNC 后立即脱水，不给 PinState 传播清除 IN_SYNC 的时间窗口
+                    CfSetInSyncState(handle,
+                        CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                        CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
+                        IntPtr.Zero);
                     int dhr = CfDehydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
-                    // 0x80070187 (NOT_IN_SYNC) 或 0x80070188 (DEHYDRATION_DISALLOWED)：
-                    // Pin→Unpin 快速切换时，PinState/InSync 传播未完成，多次重试
+                    // 失败后等待 PinState 传播稳定，再重试（设 IN_SYNC + 立即脱水）
                     if (dhr == unchecked((int)0x80070187) || dhr == unchecked((int)0x80070188))
                     {
                         FileLogger.Log($"  Dehydrate 失败 0x{(uint)dhr:X8}，重试中: {fullPath}");
-                        for (int retry = 0; retry < 3 && dhr < 0; retry++)
+                        for (int retry = 0; retry < 5 && dhr < 0
+                            && (dhr == unchecked((int)0x80070187) || dhr == unchecked((int)0x80070188)); retry++)
                         {
+                            Thread.Sleep(1000 * (retry + 1));
                             CfSetInSyncState(handle,
                                 CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
                                 CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE,
                                 IntPtr.Zero);
-                            Thread.Sleep(1000);
                             dhr = CfDehydratePlaceholder(handle, 0, -1, 0, IntPtr.Zero);
                         }
                     }
