@@ -603,11 +603,11 @@ public sealed class SyncEngine : IDisposable
         {
             var fi = new FileInfo(evt.FullPath);
             // Offline = cloud-only 白云文件（未 hydrate），不需要上传
-            // 脱水后驱动可能异步清除 IN_SYNC，需要恢复防止蓝圈
+            // PinState 异步传播会清除 IN_SYNC（蓝圈），需要完整恢复（含 SHChangeNotify + 父目录刷新）
             if (fi.Attributes.HasFlag(System.IO.FileAttributes.Offline))
             {
                 FileLogger.Log($"  跳过 Offline 文件(白云): {evt.RelativePath}");
-                SyncProviderConnection.SetItemInSyncPublic(evt.FullPath);
+                SetInSyncAfterHydration(evt.FullPath);
                 return;
             }
             // 注意：不再用 ReparsePoint 判断是否跳过！

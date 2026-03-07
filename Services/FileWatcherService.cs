@@ -174,9 +174,10 @@ public sealed class FileWatcherService : IDisposable
             return;
         }
 
-        // 目录的 Changed 事件通常是属性变化（如 Windows 搜索设置 NotContentIndexed），
-        // 这类属性变化会清除 Cloud Filter 的 IN_SYNC 状态导致显示白云。
-        // 检测到 placeholder 目录变化时，重新设置 IN_SYNC。
+        // 目录的 Changed 事件通常是属性变化（如 Windows 搜索设置 NotContentIndexed、
+        // PinState 异步传播等），这类属性变化会清除 Cloud Filter 的 IN_SYNC 状态导致蓝圈。
+        // 检测到 placeholder 目录变化时，通过 FlushDirtyDirectories 完整恢复
+        // （含 SHChangeNotify 刷新资源管理器图标 + 父目录链处理）。
         if (Directory.Exists(e.FullPath))
         {
             try
@@ -184,7 +185,9 @@ public sealed class FileWatcherService : IDisposable
                 var di = new DirectoryInfo(e.FullPath);
                 if (di.Attributes.HasFlag(System.IO.FileAttributes.ReparsePoint))
                 {
-                    SyncProviderConnection.SetItemInSyncPublic(e.FullPath);
+                    _engine.MarkDirectoryDirty(e.FullPath);
+                    _engine.MarkParentDirectoriesDirty(e.FullPath);
+                    _engine.FlushDirtyDirectories();
                 }
             }
             catch { }
