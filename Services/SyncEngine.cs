@@ -62,6 +62,9 @@ public sealed class SyncEngine : IDisposable
     private readonly ConcurrentDictionary<string, byte> _dirtyDirectories = new(StringComparer.OrdinalIgnoreCase);
     public bool HasDirtyDirectories => !_dirtyDirectories.IsEmpty;
 
+    // Pin 后定时刷新：跟踪已调度的目录，防止重复调度
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _pinRefreshTasks = new(StringComparer.OrdinalIgnoreCase);
+
     // 全量扫描防并发：0=空闲, 1=扫描排队或进行中
     private int _scanPending;
 
@@ -1285,6 +1288,88 @@ public sealed class SyncEngine : IDisposable
                 _recentlySynced[dir] = DateTime.UtcNow.Ticks;
             }
             catch { }
+        }
+    }
+
+    /// <summary>
+    /// Pin 目录后调度定时刷新 IN_SYNC 状态。
+    /// Windows Cloud Filter 驱动会在 Pin 后 1-2 分钟异步传播 PinState 到所有子项，
+    /// 此过程在 mini-filter 层清除 IN_SYNC，不会触发 FileSystemWatcher 事件，
+    /// 因此必须主动定时刷新来恢复。
+    /// </summary>
+    public void SchedulePinRefresh(string directoryPath)
+    {
+        // 取消之前对同一目录的刷新任务
+        if (_pinRefreshTasks.TryRemove(directoryPath, out var oldCts))
+        {
+            oldCts.Cancel();
+            oldCts.Dispose();
+        }
+
+        var cts = new CancellationTokenSource();
+        _pinRefreshTasks[directoryPath] = cts;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // PinState 传播通常在 1-2 分钟内完成，在 15s/45s/90s/150s 各刷新一次
+                var delaysMs = new[] { 15_000, 30_000, 45_000, 60_000 };
+                foreach (var delay in delaysMs)
+                {
+                    await Task.Delay(delay, cts.Token);
+                    RefreshDirectoryTreeInSync(directoryPath);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                FileLogger.Log($"SchedulePinRefresh 异常: {ex.Message}");
+            }
+            finally
+            {
+                _pinRefreshTasks.TryRemove(directoryPath, out _);
+                cts.Dispose();
+            }
+        });
+    }
+
+    /// <summary>
+    /// 主动刷新目录树中所有项的 IN_SYNC 状态 + 通知 Explorer 刷新图标。
+    /// 用于对抗 Cloud Filter 驱动异步清除 IN_SYNC 的场景。
+    /// </summary>
+    private void RefreshDirectoryTreeInSync(string directoryPath)
+    {
+        try
+        {
+            if (!Directory.Exists(directoryPath)) return;
+
+            FileLogger.Log($"Pin 定时刷新 IN_SYNC: {directoryPath}");
+
+            // 刷新所有文件的 IN_SYNC + 通知 Explorer
+            foreach (var file in Directory.GetFiles(directoryPath, "*", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    var fi = new FileInfo(file);
+                    if (!fi.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
+                    SyncProviderConnection.SetItemInSyncPublic(file);
+                    SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, file);
+                    MarkRecentlySynced(file);
+                }
+                catch { }
+            }
+
+            // 刷新所有目录的 IN_SYNC（通过 FlushDirtyDirectories 机制）
+            MarkDirectoryDirty(directoryPath);
+            foreach (var subDir in Directory.GetDirectories(directoryPath, "*", SearchOption.AllDirectories))
+                MarkDirectoryDirty(subDir);
+            MarkParentDirectoriesDirty(directoryPath);
+            FlushDirtyDirectories();
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Log($"RefreshDirectoryTreeInSync 异常: {ex.Message}");
         }
     }
 

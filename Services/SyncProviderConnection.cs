@@ -679,6 +679,9 @@ public sealed class SyncProviderConnection : IDisposable
                         }
                         catch { }
                     }
+                    // 调度定时刷新：Windows CF 驱动会在 1-2 分钟后异步传播 PinState，
+                    // 此过程在 mini-filter 层清除 IN_SYNC 且不触发 FileWatcher，必须主动修复
+                    _syncEngine?.SchedulePinRefresh(fullPath);
                     return true;
                 }
                 else
