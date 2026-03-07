@@ -1207,7 +1207,7 @@ public sealed class SyncEngine : IDisposable
     /// <summary>
     /// 记录需要刷新 IN_SYNC 的父目录（向上遍历到同步根目录）
     /// </summary>
-    private void MarkParentDirectoriesDirty(string fullPath)
+    public void MarkParentDirectoriesDirty(string fullPath)
     {
         var dir = Path.GetDirectoryName(fullPath);
         while (!string.IsNullOrEmpty(dir) &&

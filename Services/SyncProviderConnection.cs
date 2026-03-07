@@ -396,15 +396,11 @@ public sealed class SyncProviderConnection : IDisposable
                         catch { }
                         if (!needsDehydration)
                         {
-                            // 驱动可能异步清除 IN_SYNC（蓝圈），趁 Changed 事件到达时恢复
+                            // 冷却期内无需脱水，但目录/文件可能已丢失 IN_SYNC（蓝圈），必须恢复
                             SetItemInSync(fullPath);
-                            // 设置 IN_SYNC 可能导致 CF 驱动清除父目录 IN_SYNC，同步恢复
-                            if (isFile)
-                            {
-                                var parentDir = Path.GetDirectoryName(fullPath);
-                                if (!string.IsNullOrEmpty(parentDir) && parentDir.Length > _syncFolder.Length)
-                                    SetItemInSync(parentDir);
-                            }
+                            // 使用 FlushDirtyDirectories 完整恢复所有父目录
+                            _syncEngine?.MarkParentDirectoriesDirty(fullPath);
+                            _syncEngine?.FlushDirtyDirectories();
                             return true; // 文件已脱水，安全跳过
                         }
                         FileLogger.Log($"TryHandleDehydrateRequest 冷却期内但文件需要脱水，继续处理: {fullPath}");
@@ -619,7 +615,13 @@ public sealed class SyncProviderConnection : IDisposable
                         }
                         catch { }
                         if (!needsHydration)
-                            return true; // 文件已水合，安全跳过
+                        {
+                            // 冷却期内无需水合，但目录/文件可能已丢失 IN_SYNC（蓝圈），必须恢复
+                            SetItemInSync(fullPath);
+                            _syncEngine?.MarkParentDirectoriesDirty(fullPath);
+                            _syncEngine?.FlushDirtyDirectories();
+                            return true;
+                        }
                         FileLogger.Log($"TryHandlePinRequest 冷却期内但文件需要水合，继续处理: {fullPath}");
                     }
                 }
@@ -690,10 +692,10 @@ public sealed class SyncProviderConnection : IDisposable
                         // 驱动可能异步清除 IN_SYNC（蓝圈），趁 Changed 事件到达时恢复
                         SetItemInSync(fullPath);
                         // 设置文件 IN_SYNC 可能导致 CF 驱动清除父目录的 IN_SYNC，
-                        // 必须同步恢复父目录，否则父目录的 Changed 事件已被 RecentlySynced 吃掉无法补救
-                        var parentDir = Path.GetDirectoryName(fullPath);
-                        if (!string.IsNullOrEmpty(parentDir) && parentDir.Length > _syncFolder.Length)
-                            SetItemInSync(parentDir);
+                        // 使用 FlushDirtyDirectories 完整恢复所有父目录
+                        // （CfConvertToPlaceholder + CfSetInSyncState + SHChangeNotify + RecentlySynced）
+                        _syncEngine?.MarkParentDirectoriesDirty(fullPath);
+                        _syncEngine?.FlushDirtyDirectories();
                         FileLogger.Log($"TryHandlePinRequest PINNED+已水合，刷新冷却: {fullPath}");
                         return true;
                     }
