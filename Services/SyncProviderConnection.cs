@@ -470,12 +470,14 @@ public sealed class SyncProviderConnection : IDisposable
                     }
                     FileLogger.Log($"  已释放空间: {fullPath} ({count}个文件)");
                     _dehydrateCooldown[fullPath] = DateTime.UtcNow.Ticks;
-                    // 目录及子目录设置 IN_SYNC，防止蓝圈
-                    SetItemInSync(fullPath);
+                    // 目录、子目录、父目录统一通过 FlushDirtyDirectories 恢复 IN_SYNC + SHChangeNotify，防止蓝圈
+                    _syncEngine?.MarkDirectoryDirty(fullPath);
                     foreach (var subDir in Directory.GetDirectories(fullPath, "*", SearchOption.AllDirectories))
                     {
-                        try { SetItemInSync(subDir); } catch { }
+                        try { _syncEngine?.MarkDirectoryDirty(subDir); } catch { }
                     }
+                    _syncEngine?.MarkParentDirectoriesDirty(fullPath);
+                    _syncEngine?.FlushDirtyDirectories();
                     return true;
                 }
                 else
